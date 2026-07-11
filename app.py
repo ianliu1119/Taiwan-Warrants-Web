@@ -3,6 +3,7 @@ import warrant_logic
 import options_logic
 import us_options_logic
 import scheduler
+import fubon_feed
 import auth
 import db
 from auth import require_auth
@@ -1237,8 +1238,31 @@ def refresh():
     return jsonify(scheduler.force_refresh(kind))
 
 
+_LIVE_SYMBOL_CAP = 200
+
+
+@app.route("/live_quotes")
+@require_auth
+def live_quotes():
+    """Real-time quotes for the requested symbols + feed status.
+
+    ?symbols=2330,2317,...  (comma-separated, capped at 200). Requested symbols
+    not already subscribed are subscribed on demand so a user viewing a custom
+    symbol outside the default universe still gets ticks (first response may
+    omit them until the first tick arrives — poll again).
+    """
+    raw = request.args.get("symbols", "")
+    symbols = [s.strip() for s in raw.split(",") if s.strip()][:_LIVE_SYMBOL_CAP]
+    fubon_feed.subscribe_symbols(symbols)
+    return jsonify({
+        "quotes": fubon_feed.get_quotes(symbols),
+        "status": fubon_feed.feed_status(),
+    })
+
+
 if __name__ == "__main__":
     # Local dev entry point. Production runs via wsgi.py + gunicorn.
     scheduler.start()
+    fubon_feed.start()
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False)

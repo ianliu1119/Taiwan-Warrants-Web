@@ -95,3 +95,39 @@ def all_custom_stock_codes():
             if isinstance(s, dict) and s.get("code"):
                 codes.add(s["code"])
     return list(codes)
+
+
+import re as _re
+
+_TW_CODE_RE = _re.compile(r"^\d{4}$")
+
+
+def _collect_tw_codes(obj, out):
+    """Recursively pull 4-digit Taiwan stock codes out of an arbitrary payload.
+
+    Portfolio trade payloads are heterogeneous (direct/pcp/us/twus modes, nested
+    `row` objects). Underlying TW listings are always 4-digit numeric strings,
+    whereas warrant codes are 6 digits — so a strict 4-digit match cleanly picks
+    up the tradable underlyings and skips warrant codes / free text.
+    """
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _collect_tw_codes(v, out)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _collect_tw_codes(v, out)
+    elif isinstance(obj, str) and _TW_CODE_RE.match(obj):
+        out.add(obj)
+
+
+def all_portfolio_symbols():
+    """Union of every user's portfolio TW underlying codes (for the live feed).
+
+    Best-effort: scans all portfolio payloads for 4-digit TW stock codes so the
+    real-time feed can subscribe to symbols users actually hold.
+    """
+    r = client().table("portfolio").select("payload").execute()
+    codes = set()
+    for row in (r.data or []):
+        _collect_tw_codes(row.get("payload"), codes)
+    return list(codes)

@@ -119,6 +119,22 @@ After the service is created, set these three secrets in the Render dashboard (t
 
 The blueprint uses the **starter** plan; the free tier tends to OOM because Chromium is memory-hungry.
 
+### Real-time feed (optional)
+
+The live-quote feed (`fubon_feed.py`, exposed at `GET /live_quotes`) defaults to a
+built-in **mock** source (stdlib only, no credentials) so it runs everywhere. To
+switch to the real Fubon Neo securities websocket, set these env vars (leave them
+unset/empty for the mock — never commit real values):
+
+- `FEED_SOURCE` — `mock` (default) or `fubon`
+- `FUBON_ID` — Fubon account id (required when `FEED_SOURCE=fubon`)
+- `FUBON_PWD` — Fubon password
+- `FUBON_CERT_PATH` — path to the certificate file
+- `FUBON_CERT_PWD` — certificate password (may be empty)
+
+`FEED_SOURCE=fubon` additionally requires the `fubon_neo` SDK to be installed (not
+in `requirements.txt` yet — the mock path needs no extra dependency).
+
 **Post-deploy:** add the live Render URL (e.g. `https://<service>.onrender.com`) to your Supabase project's **Auth → URL Configuration → Redirect URLs**, or magic-link sign-in will fail.
 
 ---
