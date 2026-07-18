@@ -10,10 +10,20 @@ lands in Supabase, and the other side sees it on its next page load. Your local
 `portfolio.json` is kept as a readable backup mirror so you can still view your
 portfolio if Render is down.
 
-> ⚠️ **Do the seed (Part B, steps 3–5) BEFORE you run the app locally for the first
-> time.** Once local mode runs, it reads Supabase and *overwrites* `portfolio.json`
-> with the database contents. If you launch the app before seeding, your local-only
-> trades get wiped by the (empty or partial) Supabase copy. **Seed first, run second.**
+### Two ways to use this guide
+
+- **Just sync my trades** (most people): do Part A and Part B steps 1–6. This uploads
+  your existing `portfolio.json` into Supabase once; afterward your trades show on the
+  Render app. You can then **delete this folder** — your data lives in Supabase, not
+  here. You do *not* need to run the app.
+- **Also run a local backup app**: additionally do Part B step 7. This runs a
+  standalone localhost copy so you can still use your portfolio when Render is down.
+  In this case, **keep the folder** — the app runs from it.
+
+> ⚠️ **Do the seed (Part B, steps 4–6) BEFORE you ever run the app locally.** Once
+> local mode runs, it reads Supabase and *overwrites* `portfolio.json` with the
+> database contents. If you launch the app before seeding, your local-only trades get
+> wiped by the (empty or partial) Supabase copy. **Seed first, run second.**
 
 ---
 
@@ -43,12 +53,35 @@ portfolio if Render is down.
 
 ## Part B — Local setup (you run these)
 
-1. **Get the code** and install dependencies (a virtualenv is recommended):
+1. **Clone this branch** into a fresh folder (this does not touch any repo you
+   already have):
    ```bash
-   pip install -r requirements.txt
+   git clone -b worktree-web-deploy https://github.com/ianliu1119/Taiwan-Warrants-Web.git warrant-sync
+   cd warrant-sync
    ```
+   Verify you're on the right branch — the seed script and `db.py` exist **only** on
+   `worktree-web-deploy`, not on `main`:
+   ```bash
+   git branch --show-current              # must print: worktree-web-deploy
+   ls db.py scripts/migrate_portfolio_to_supabase.py   # both must be listed
+   ```
+   > If `db.py` is missing you're on the wrong branch. Fix it with
+   > `git checkout worktree-web-deploy`, then re-check.
 
-2. **Create `.env`** from the template and fill it in:
+2. **Create a Python environment and install dependencies.**
+   - For **seeding only** (Two ways → "Just sync my trades"), you just need the
+     Supabase client:
+     ```bash
+     python3 -m venv .venv
+     source .venv/bin/activate            # Windows: .venv\Scripts\activate
+     pip install supabase==2.31.0
+     ```
+   - To **also run the app** later (step 7), install everything instead:
+     ```bash
+     pip install -r requirements.txt
+     ```
+
+3. **Create `.env`** from the template and fill it in:
    ```bash
    cp .env.example .env
    ```
@@ -63,32 +96,49 @@ portfolio if Render is down.
    ```
    `LOCAL_USER_ID` set + `RENDER` unset is what enables no-login local mode.
 
-3. **Put your existing `portfolio.json` in the repo root, then back it up:**
+4. **Bring your real `portfolio.json` into this folder, then back it up.** This is two
+   actions — the fresh clone does **not** contain a `portfolio.json` (it's gitignored
+   personal data), so you must copy in your own file first:
    ```bash
+   # 4a. copy YOUR existing trade file (from wherever your app keeps it) into this folder:
+   cp /path/to/your-app/portfolio.json ./portfolio.json
+   # 4b. then make a safety backup of it:
    cp portfolio.json portfolio.json.backup
    ```
+   > If you skip 4a, the seed will find zero trades (or the backup line errors with
+   > "No such file"). Nothing to sync means the file isn't here yet.
 
-4. **Preview the seed (dry run — writes nothing):**
+5. **Preview the seed (dry run — writes nothing):**
    ```bash
    python scripts/migrate_portfolio_to_supabase.py
    ```
-   It prints every trade it *would* upload under your `LOCAL_USER_ID`. Confirm the
-   count and titles look right.
+   It reads `LOCAL_USER_ID` from your `.env` and prints every trade it *would* upload.
+   **Check the `portfolio: N entries` line** — `N` should match your real trade count.
+   If it's `0`, your file isn't in the folder yet (go back to 4a). If you see
+   `entry has no id`, stop — your portfolio format lacks per-trade IDs; ask the owner.
+   > `LOCAL_USER_ID` not picked up? Pass it explicitly:
+   > `python scripts/migrate_portfolio_to_supabase.py --user-id <YOUR_UUID>`
 
-5. **Commit the seed for real:**
+6. **Commit the seed for real:**
    ```bash
    python scripts/migrate_portfolio_to_supabase.py --commit
    ```
-   This is **additive** — it only inserts/updates your rows and never deletes, so it
-   safely *combines* your local `portfolio.json` with anything already in your
-   Supabase account (e.g. trades you made on the live site).
+   Expected final line: `committed: upserted N rows.` This is **additive** — it only
+   inserts/updates your rows and never deletes, so it safely *combines* your local
+   `portfolio.json` with anything already in your Supabase account (e.g. trades you
+   made on the live site). Your trades now show on the Render app.
 
-6. **Now — and only now — run the app locally:**
+   **If you only wanted to sync your trades, you're done here** — you can delete this
+   folder; your data is safely in Supabase. Continue to step 7 only if you also want a
+   local backup app.
+
+7. **(Optional) Run the app locally** — only if you want a standalone backup instance:
    ```bash
    python wsgi.py     # or your usual local launch command
    ```
    It opens with no login and shows your combined portfolio. From here,
-   `portfolio.json` is kept as a live backup mirror of Supabase.
+   `portfolio.json` is kept as a live backup mirror of Supabase. **Keep this folder**
+   as long as you use the local app.
 
 ---
 
