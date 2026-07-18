@@ -25,7 +25,7 @@ import traceback
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
-import scheduler  # for DEFAULT_WARRANT_STOCKS (single source of truth)
+from services import scheduler  # for DEFAULT_WARRANT_STOCKS (single source of truth)
 
 # ── Live quote cache ─────────────────────────────────────────────────────────
 # symbol -> {"price","bid","ask","size","volume","ts"}; ts is float epoch seconds
@@ -371,7 +371,7 @@ def _make_source():
 def _portfolio_symbols():
     """All portfolio TW codes across users; [] on any failure (mirror scheduler)."""
     try:
-        import db
+        from services import db
         return db.all_portfolio_symbols()
     except Exception as e:
         print(f"FEED: portfolio symbols unavailable: {e}", flush=True)
@@ -380,7 +380,7 @@ def _portfolio_symbols():
 
 def _custom_symbols():
     try:
-        import db
+        from services import db
         return db.all_custom_stock_codes()
     except Exception as e:
         print(f"FEED: custom stock codes unavailable: {e}", flush=True)

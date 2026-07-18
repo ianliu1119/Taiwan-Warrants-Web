@@ -152,16 +152,20 @@ The blueprint uses the **starter** plan; the free tier's 512 MB is tight for the
 
 ### Real-time feed (optional)
 
-The live-quote feed (`fubon_feed.py`, exposed at `GET /live_quotes`) defaults to a
-built-in **mock** source (stdlib only, no credentials) so it runs everywhere. To
-switch to the real Fubon Neo securities websocket, set these env vars (leave them
-unset/empty for the mock — never commit real values):
+The live-quote feed (`services/fubon_feed.py`, exposed at `GET /live_quotes`)
+defaults to a built-in **mock** source (stdlib only, no credentials) so it runs
+everywhere. To switch to the real Fubon Neo securities websocket, set these env
+vars (leave them unset/empty for the mock — never commit real values):
 
 - `FEED_SOURCE` — `mock` (default) or `fubon`
 - `FUBON_ID` — Fubon account id (required when `FEED_SOURCE=fubon`)
 - `FUBON_PWD` — Fubon password
 - `FUBON_CERT_PATH` — path to the certificate file
 - `FUBON_CERT_PWD` — certificate password (may be empty)
+
+**Starting the feed:** local dev (`python app.py`) starts it automatically. In
+production (`wsgi.py` under gunicorn) it is opt-in via `ENABLE_FEED=1` (default
+OFF), mirroring `ENABLE_SCHEDULER`.
 
 `FEED_SOURCE=fubon` additionally requires the `fubon_neo` SDK to be installed (not
 in `requirements.txt` yet — the mock path needs no extra dependency).

@@ -7,6 +7,7 @@ from services import scheduler
 from services import auth
 from services import db
 from services import store
+from services import fubon_feed
 from logic import arb_logic
 from services.auth import require_auth
 import os
@@ -706,6 +707,28 @@ def refresh():
     return jsonify(scheduler.force_refresh(kind))
 
 
+_LIVE_SYMBOL_CAP = 200
+
+
+@app.route("/live_quotes")
+@require_auth
+def live_quotes():
+    """Real-time quotes for the requested symbols + feed status.
+
+    ?symbols=2330,2317,...  (comma-separated, capped at 200). Requested symbols
+    not already subscribed are subscribed on demand so a user viewing a custom
+    symbol outside the default universe still gets ticks (first response may
+    omit them until the first tick arrives — poll again).
+    """
+    raw = request.args.get("symbols", "")
+    symbols = [s.strip() for s in raw.split(",") if s.strip()][:_LIVE_SYMBOL_CAP]
+    fubon_feed.subscribe_symbols(symbols)
+    return jsonify({
+        "quotes": fubon_feed.get_quotes(symbols),
+        "status": fubon_feed.feed_status(),
+    })
+
+
 def open_browser(port):
     webbrowser.open(f"http://127.0.0.1:{port}")
 
@@ -784,6 +807,9 @@ if __name__ == "__main__":
         scheduler.start()
     else:
         print("SCHED: disabled (set ENABLE_SCHEDULER=1 to enable)", flush=True)
+    # Real-time quote feed (mock by default; Fubon via FEED_SOURCE=fubon). Cheap
+    # mock path, so always on in local dev; production gates it in wsgi.py.
+    fubon_feed.start()
     print("Step 1: resolving port", flush=True)
     port = _resolve_port(int(os.environ.get("PORT", 5001)))
     print(f"Step 2: starting browser timer (port {port})", flush=True)

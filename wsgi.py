@@ -7,6 +7,7 @@ import os
 
 from services import memlog
 from services import scheduler
+from services import fubon_feed
 from app import app
 
 memlog.log_baseline("boot")
@@ -21,3 +22,12 @@ if os.environ.get("ENABLE_SCHEDULER") == "1":
     scheduler.start()
 else:
     print("SCHED: disabled (set ENABLE_SCHEDULER=1 to enable)", flush=True)
+
+# Real-time quote feed (mock by default; Fubon via FEED_SOURCE=fubon). Like the
+# scheduler it is OPT-IN via ENABLE_FEED (default OFF): the mock path is cheap,
+# but real Fubon fetching is deferred, so prod stays off until it is wired up.
+# Runs in daemon threads; binding the port is not delayed.
+if os.environ.get("ENABLE_FEED") == "1":
+    fubon_feed.start()
+else:
+    print("FEED: disabled (set ENABLE_FEED=1 to enable)", flush=True)
