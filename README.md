@@ -66,15 +66,28 @@ Uses put-call parity to identify mispricing between call and put warrants via sy
 ## Architecture
 
 ```
-app.py              Flask routes + arb matching logic
-warrant_logic.py    CMoney data fetch, IV/delta/leverage computation
-options_logic.py    TAIFEX option data fetch and computation
+app.py                Flask routes (request/response only)
+wsgi.py               gunicorn entry point (wsgi:app)
+logic/                pure market-data + math, no side effects
+  warrant_logic.py      CMoney data fetch, IV/delta/leverage computation
+  options_logic.py      TAIFEX option data fetch and computation
+  us_options_logic.py   US ADR option data fetch and computation
+  arb_logic.py          warrant<->option matching, put-call parity, TW/US leg arb
+services/             side-effecting infrastructure
+  db.py                 Supabase client
+  store.py              portfolio persistence (Supabase + local JSON mirror)
+  auth.py               JWT verification + email allowlist
+  scheduler.py          APScheduler cache-refresh jobs (opt-in)
+  applog.py memlog.py   request + memory logging
 templates/
-  index.html        Single-page frontend (Plotly, vanilla JS)
+  index.html          single-page frontend shell (Jinja + Plotly)
+static/
+  css/app.css           extracted stylesheet
+  js/*.js               extracted JS bundles (common, quant, scanners, arb, portfolio)
 ```
 
 **Data sources:**
-- **Warrants** — CMoney private API (`mainpage.ashx`), requires a session `cmkey` token extracted at startup via a headless Playwright/Chromium browser
+- **Warrants** — CMoney private API (`mainpage.ashx`), requires a `cmkey` token scraped from the warrantsquery page HTML (plain HTTP, no browser)
 - **Options** — TAIFEX public CSV download (`optDataDown`)
 - **Spot prices** — TWSE MIS API, Yahoo Finance fallback, yfinance fallback
 
@@ -84,6 +97,11 @@ templates/
 - All Taiwan equity options use exercise ratio = 2,000 shares/contract
 - TXO index options use 50 NT$/point
 
+**Notebooks:** `notebooks/` holds exploratory research (ADR parity, universe
+screening). Committed **without outputs** — clear cell outputs before committing
+(`jupyter nbconvert --clear-output --inplace notebooks/*.ipynb`, or the jq one-liner
+in the git history) to keep diffs small.
+
 ---
 
 ## Running Locally
@@ -92,14 +110,27 @@ templates/
 # Requires Python 3.11+ (conda env: warrants)
 conda activate warrants
 pip install -r requirements.txt
-playwright install chromium   # first time only
 
-# Dev server
-python app.py                 # http://127.0.0.1:5001
+# Dev server — always prefix with the Taiwan timezone (see note below)
+TZ=Asia/Taipei python app.py                 # http://127.0.0.1:5001
 
 # Production-style (what deployment uses)
-gunicorn -w 1 --threads 8 --timeout 180 -b 0.0.0.0:5001 wsgi:app
+TZ=Asia/Taipei gunicorn -w 1 --threads 8 --timeout 180 -b 0.0.0.0:5001 wsgi:app
 ```
+
+Stop the dev server with **`Ctrl+C`** in that terminal (or `pkill -f "python app.py"`).
+
+**Always set `TZ=Asia/Taipei`.** The scanners compute days-to-expiry against the
+machine's local "today". On a machine west of Taiwan (e.g. US Pacific) the local
+date is a day behind Taiwan for part of the day, so an already-expired option
+batch leaks into the results and counts come out inflated (e.g. ~1580 locally vs
+~1407 on the UTC deploy). The `TZ` prefix scopes Taiwan time to this process only
+— it does not change your computer's clock.
+
+**No-login local mode.** With `LOCAL_USER_ID` set in `.env` and `RENDER` unset, the
+app runs with no login and acts as that fixed user, syncing its portfolio with the
+shared Supabase. `.env` lives at the **repo root** (loaded by `services/db.py`). See
+[`SETUP-LOCAL.md`](SETUP-LOCAL.md) for the full local-redundancy setup and seeding steps.
 
 Exactly **1 gunicorn worker**: market-data caches live in process memory and would diverge across workers; threads provide concurrency.
 
@@ -109,7 +140,7 @@ Exactly **1 gunicorn worker**: market-data caches live in process memory and wou
 
 ## Deploy (Render)
 
-The repo ships a `render.yaml` blueprint. In the Render dashboard, create a new **Blueprint** from this repo — it provisions a native Python web service that installs Playwright Chromium at build time and runs gunicorn with a single worker.
+The repo ships a `render.yaml` blueprint. In the Render dashboard, create a new **Blueprint** from this repo — it provisions a native Python web service that runs gunicorn with a single worker.
 
 After the service is created, set these three secrets in the Render dashboard (they are marked `sync: false`, so Render prompts for them — never commit real values):
 
@@ -117,7 +148,7 @@ After the service is created, set these three secrets in the Render dashboard (t
 - `SUPABASE_ANON_KEY`
 - `SUPABASE_SERVICE_ROLE_KEY`
 
-The blueprint uses the **starter** plan; the free tier tends to OOM because Chromium is memory-hungry.
+The blueprint uses the **starter** plan; the free tier's 512 MB is tight for the pandas/numpy/scipy working set.
 
 ### Real-time feed (optional)
 

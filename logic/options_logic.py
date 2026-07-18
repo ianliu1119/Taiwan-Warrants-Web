@@ -1,11 +1,14 @@
 import io
 import re
 import time
+from datetime import datetime
 import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from warrant_logic import implied_vol, bs_delta, calc_real_leverage
+from services import applog
+from services import db_market
+from logic.warrant_logic import implied_vol, bs_delta, calc_real_leverage
 
 R = 0.01875  # Taiwan CBC benchmark rate
 
@@ -32,6 +35,16 @@ def data_as_of(stock_codes):
     MIS (intraday) entries are checked first since they are the primary
     source; EOD taifex entries only matter when MIS failed.
     """
+    # Snapshot mode: the freshness is the snapshot batch's created_at, returned
+    # as an epoch float so the route's _epoch_iso(...) still works.
+    if db_market.snapshot_enabled():
+        try:
+            iso = db_market.snapshot_as_of("tw_options")
+        except Exception:
+            iso = None
+        if iso:
+            return datetime.fromisoformat(iso).timestamp()
+        return None
     ts_list = []
     for code in stock_codes:
         cfg = COMMODITY_MAP.get(code)
@@ -80,8 +93,11 @@ def _fetch_taifex(commodity_ids: list[str]) -> pd.DataFrame:
     if cache_key in _taifex_cache:
         ts, cached_df = _taifex_cache[cache_key]
         if now - ts < _CACHE_TTL:
+            applog.log("OPT", f"EOD {cache_key} cache hit (age {int(now - ts)}s)")
             return cached_df
 
+    applog.log("OPT", f"EOD {cache_key} fetching TAIFEX download")
+    t0 = time.time()
     today = pd.Timestamp.today()
     start = (today - pd.Timedelta(days=7)).strftime("%Y/%m/%d")
     end = today.strftime("%Y/%m/%d")
@@ -121,6 +137,10 @@ def _fetch_taifex(commodity_ids: list[str]) -> pd.DataFrame:
     else:
         df = df.drop(columns=["_settle_num"], errors="ignore")
 
+    applog.log(
+        "OPT",
+        f"EOD {cache_key} fetched {len(df)} rows in {time.time() - t0:.1f}s",
+    )
     _taifex_cache[cache_key] = (now, df)
     return df
 
@@ -142,7 +162,8 @@ def _clean_num(series, fill=np.nan):
     )
 
 
-def _parse_and_compute(raw_df, underlying_price, exercise_ratio, compute_iv=True):
+def _parse_and_compute(raw_df, underlying_price, exercise_ratio, compute_iv=True,
+                       keep_noniv=False):
     df = raw_df.copy()
     df.columns = df.columns.str.strip()
 
@@ -241,10 +262,15 @@ def _parse_and_compute(raw_df, underlying_price, exercise_ratio, compute_iv=True
             if np.isnan(iv_ask) and not np.isnan(iv_bid):
                 iv_ask = iv_bid
             if np.isnan(iv_ask):
-                continue
-
-            delta = bs_delta(S, K, T, R, iv_ask, 1.0, is_put)
-            leverage = calc_real_leverage(S, abs(delta), ask)
+                # keep_noniv (superset-with-IV mode): keep the row with all
+                # IV-derived metrics NaN instead of dropping it, mirroring the
+                # compute_iv=False null assignment for this one row.
+                if not keep_noniv:
+                    continue
+                iv_ask = iv_bid = delta = leverage = np.nan
+            else:
+                delta = bs_delta(S, K, T, R, iv_ask, 1.0, is_put)
+                leverage = calc_real_leverage(S, abs(delta), ask)
         else:
             # Arb finder does not use IV/delta/leverage — skip the solve so an
             # option is never dropped just because IV wouldn't converge.
@@ -346,7 +372,10 @@ def _fetch_mis_quotes(cid, kind):
     key = (cid, kind)
     now = time.time()
     if key in _mis_cache and now - _mis_cache[key][0] < _MIS_TTL:
+        applog.log("OPT", f"MIS {cid} cache hit (age {int(now - _mis_cache[key][0])}s)")
         return _mis_cache[key][1]
+    applog.log("OPT", f"MIS {cid} fetching quotes")
+    t0 = time.time()
     headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0",
                "Referer": "https://mis.taifex.com.tw/futures/"}
     rows = []
@@ -365,11 +394,15 @@ def _fetch_mis_quotes(cid, kind):
         if len(rows) >= total or not ql:
             break
         page += 1
+    applog.log(
+        "OPT",
+        f"MIS {cid} fetched {len(rows)} quotes in {time.time() - t0:.1f}s",
+    )
     _mis_cache[key] = (now, rows)
     return rows
 
 
-def fetch_options_mis(code, compute_iv=True):
+def fetch_options_mis(code, compute_iv=True, keep_noniv=False):
     """Intraday (~20 min delayed) TW option chain from TAIFEX MIS, in the same
     schema as _parse_and_compute so callers are unchanged. Raises on failure."""
     cfg = COMMODITY_MAP[code]
@@ -408,11 +441,15 @@ def fetch_options_mis(code, compute_iv=True):
         if dte <= 0:
             continue
         bid = _mis_num(q.get("CBestBidPrice"))
+        bid_size = _mis_num(q.get("CBestBidSize"))
         if pd.isna(bid):
             bid = _mis_num(q.get("CBidPrice1"))
+            bid_size = _mis_num(q.get("CBidSize1"))
         ask = _mis_num(q.get("CBestAskPrice"))
+        ask_size = _mis_num(q.get("CBestAskSize"))
         if pd.isna(ask):
             ask = _mis_num(q.get("CAskPrice1"))
+            ask_size = _mis_num(q.get("CAskSize1"))
         last = _mis_num(q.get("CLastPrice"))
         settle = _mis_num(q.get("SettlementPrice"))
         is_live = bool(pd.notna(bid) and pd.notna(ask))
@@ -434,9 +471,14 @@ def fetch_options_mis(code, compute_iv=True):
             if np.isnan(iv_ask) and not np.isnan(iv_bid):
                 iv_ask = iv_bid
             if np.isnan(iv_ask):
-                continue
-            delta = bs_delta(spot, K, T, r_free, iv_ask, ratio, is_put)
-            leverage = calc_real_leverage(spot, abs(delta), ask)
+                # keep_noniv (superset-with-IV mode): keep the row with all
+                # IV-derived metrics NaN instead of dropping it.
+                if not keep_noniv:
+                    continue
+                iv_ask = iv_bid = delta = leverage = np.nan
+            else:
+                delta = bs_delta(spot, K, T, r_free, iv_ask, ratio, is_put)
+                leverage = calc_real_leverage(spot, abs(delta), ask)
         else:
             iv_ask = iv_bid = delta = leverage = np.nan
 
@@ -452,6 +494,10 @@ def fetch_options_mis(code, compute_iv=True):
             "underlying_price": round(spot, 4), "ask": round(ask, 4),
             "bid": round(bid, 4) if pd.notna(bid) else None,
             "days_to_expiry": dte, "strike": K, "exercise_ratio": ratio,
+            # Best-level orderbook size (口/contracts) from TAIFEX MIS, so the
+            # arb finder can check whether the needed contracts fill at the quote.
+            "bid_size": int(bid_size) if pd.notna(bid_size) else None,
+            "ask_size": int(ask_size) if pd.notna(ask_size) else None,
             "volume": int(_mis_num(q.get("CTotalVolume")) or 0) if pd.notna(_mis_num(q.get("CTotalVolume"))) else 0,
             "oi": int(_mis_num(q.get("OpenInterest")) or 0) if pd.notna(_mis_num(q.get("OpenInterest"))) else 0,
             "time_value_am": time_value_am,
@@ -467,46 +513,14 @@ def fetch_options_mis(code, compute_iv=True):
     return pd.DataFrame(rows)
 
 
-def fetch_options(
-    stock_codes,
-    option_type="All",
-    min_days=0,
-    max_days=365,
-    min_leverage=0,
-    min_volume=0,
-    compute_iv=True,
-):
-    dfs = []
-    errors = []
-    for code in stock_codes:
-        if code not in COMMODITY_MAP:
-            errors.append(f"{code}: not supported")
-            continue
-        cfg = COMMODITY_MAP[code]
-        df = None
-        # Primary: MIS intraday quotes. Fallback: EOD data-download file.
-        try:
-            df = fetch_options_mis(code, compute_iv=compute_iv)
-        except Exception as e:
-            errors.append(f"{code}: MIS {e}")
-            df = None
-        if df is None or df.empty:
-            try:
-                S = _get_spot(cfg["ticker"])
-                raw = _fetch_taifex(cfg["commodity_ids"])
-                df = _parse_and_compute(raw, S, cfg["exercise_ratio"], compute_iv=compute_iv)
-            except Exception as e:
-                errors.append(f"{code}: EOD {e}")
-                df = None
-        if df is not None and not df.empty:
-            dfs.append(df)
+def _apply_option_filters(result, option_type, min_days, max_days, min_leverage,
+                          min_volume):
+    """Post-concat option filter chain + final sort.
 
-    if not dfs:
-        err_msg = "; ".join(errors) if errors else "No data returned"
-        raise RuntimeError(err_msg)
-
-    result = pd.concat(dfs, ignore_index=True)
-
+    Pure filtering (day-range, min_leverage, min_volume, option_type) followed by
+    the canonical sort/reset. Shared by the live and supabase read paths so the
+    two produce identical frames.
+    """
     result = result[
         result["days_to_expiry"].between(int(min_days), int(max_days))
     ]
@@ -516,5 +530,96 @@ def fetch_options(
         result = result[result["volume"] >= float(min_volume)]
     if option_type != "All":
         result = result[result["type"] == option_type]
-
     return result.sort_values(["days_to_expiry", "strike"]).reset_index(drop=True)
+
+
+def fetch_options(
+    stock_codes,
+    option_type="All",
+    min_days=0,
+    max_days=365,
+    min_leverage=0,
+    min_volume=0,
+    compute_iv=True,
+    keep_noniv=False,
+):
+    # Snapshot-first read (MARKET_SOURCE=supabase). The stored snapshot is the
+    # superset-with-IV; compute_iv=True (scanner) drops non-converged-IV rows,
+    # compute_iv=False (arb) keeps the superset. Empty snapshot / read error
+    # falls through to the live path; a non-empty snapshot keeps the live
+    # raise-on-empty contract.
+    if db_market.snapshot_enabled():
+        snap = None
+        try:
+            snap, _as_of = db_market.read_snapshot("tw_options", codes=list(stock_codes))
+        except Exception as e:
+            applog.log("OPT", f"supabase read failed ({e}) — falling back to live")
+            snap = None
+        if snap is not None and not snap.empty:
+            if compute_iv:
+                snap = snap[snap["iv_ask"].notna()]
+            else:
+                # Live compute_iv=False emits NaN IV-derived metrics; blank the
+                # superset's stored values so the arb path (which branches on IV
+                # presence) matches the live arb frame exactly.
+                snap = snap.copy()
+                for _c in ("iv_ask", "iv_bid", "delta_calc", "leverage_calc"):
+                    if _c in snap.columns:
+                        snap[_c] = np.nan
+            result = _apply_option_filters(
+                snap, option_type, min_days, max_days, min_leverage, min_volume
+            )
+            if result.empty:
+                raise RuntimeError("No data returned")
+            return result
+
+    dfs = []
+    errors = []
+    for code in stock_codes:
+        if code not in COMMODITY_MAP:
+            errors.append(f"{code}: not supported")
+            applog.log("OPT", f"{code} not supported")
+            continue
+        cfg = COMMODITY_MAP[code]
+        df = None
+        # Primary: MIS intraday quotes. Fallback: EOD data-download file.
+        try:
+            df = fetch_options_mis(code, compute_iv=compute_iv, keep_noniv=keep_noniv)
+            applog.log("OPT", f"{code} source=MIS {len(df)} contracts")
+        except Exception as e:
+            errors.append(f"{code}: MIS {e}")
+            # MIS is the primary intraday source; falling back to EOD means the
+            # data is up to a day stale, so the fallback itself is the signal.
+            applog.log("OPT", f"{code} MIS failed ({e}) — falling back to TAIFEX EOD")
+            df = None
+        if df is None or df.empty:
+            try:
+                S = _get_spot(cfg["ticker"])
+                raw = _fetch_taifex(cfg["commodity_ids"])
+                df = _parse_and_compute(raw, S, cfg["exercise_ratio"], compute_iv=compute_iv,
+                                        keep_noniv=keep_noniv)
+                applog.log("OPT", f"{code} source=EOD {len(df)} contracts spot={S}")
+            except Exception as e:
+                errors.append(f"{code}: EOD {e}")
+                applog.log("OPT", f"{code} EOD failed: {e}")
+                df = None
+        if df is not None and not df.empty:
+            dfs.append(df)
+
+    if not dfs:
+        err_msg = "; ".join(errors) if errors else "No data returned"
+        applog.log("OPT", f"{','.join(stock_codes)} -> no data: {err_msg}")
+        raise RuntimeError(err_msg)
+
+    result = pd.concat(dfs, ignore_index=True)
+
+    result = _apply_option_filters(
+        result, option_type, min_days, max_days, min_leverage, min_volume
+    )
+
+    applog.log(
+        "OPT",
+        f"{','.join(stock_codes)} -> {len(result)} rows type={option_type} "
+        f"days={min_days}-{max_days}",
+    )
+    return result

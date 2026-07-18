@@ -17,11 +17,14 @@ single spot FX snapshot is used for every conversion.
 """
 
 import time
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from warrant_logic import implied_vol, bs_delta, calc_real_leverage
+from services import applog
+from services import db_market
+from logic.warrant_logic import implied_vol, bs_delta, calc_real_leverage
 
 # One US option contract covers 100 ADRs. The number of ordinary (Taiwan)
 # shares per ADR ("adr_ratio") is per-listing, so contract size in Taiwan
@@ -52,6 +55,15 @@ _CACHE_TTL = 1200  # refreshed every 15 min by the scheduler (Yahoo is ~15 min d
 
 def data_as_of(stock_code):
     """Timestamp (epoch) of the cached chain for this code, or None."""
+    # Snapshot mode: freshness is the snapshot batch's created_at as an epoch.
+    if db_market.snapshot_enabled():
+        try:
+            iso = db_market.snapshot_as_of("us_options")
+        except Exception:
+            iso = None
+        if iso:
+            return datetime.fromisoformat(iso).timestamp()
+        return None
     ts_list = [
         ts for (code, _civ), (ts, _df) in _cache.items() if code == stock_code
     ]
@@ -148,30 +160,38 @@ def adr_premium_scenario(stock_code, horizon_days, period="3y"):
     ends_p = p[k:]
     fx_ratio = F[k:] / F[: n - k]              # F_exit / F_entry for each window
 
-    # ── Premium: center on TODAY, use the UNCONDITIONAL move distribution ──
-    # Take every k-day forward premium *move* in history (not conditioned on the
-    # starting level), apply it to today's premium, and bucket by whether it
-    # carries premium more than ±5% beyond today (bigger drop / reverts) or stays.
-    moves = ends_p - starts_p                    # all k-day forward changes
-    ends_cond = p0 + moves                        # exit premium centered on today
-    fx_cond = fx_ratio                            # paired FX move per window
+    # ── Premium move STRIPPED of FX (exact identity, not a regression) ──
+    # By definition 1+prem = (adr_usd/ratio)·FX / tw_local, so over any window
+    #     Δln(1+prem) = Δln(FX) + [ Δln(adr_usd) − Δln(tw_local) ].
+    # The bracket is the residual "basis" move Δb — the ADR moving in USD vs the
+    # local moving in TWD, i.e. the premium change NOT explained by FX (the
+    # US-only basis risk, e.g. semiconductor sentiment). FX enters premium with
+    # coefficient EXACTLY 1, so subtracting the FX log-move isolates the basis.
+    # The option leg's moneyness is driven by this residual only; FX is priced
+    # as its own separate EV line, so neither risk is double-counted.
+    lp = np.log1p(p)
+    lf = np.log(F)
+    db = (lp[k:] - lp[: n - k]) - (lf[k:] - lf[: n - k])   # residual basis log-move / window
+    # Apply the FX-stripped move to today's premium with FX held flat:
+    #   1 + p_eff = (1 + p0)·exp(Δb)
+    ends_cond = (1.0 + p0) * np.exp(db) - 1.0
     conditional = True
     band = None
 
     def bucket(mask, label):
         prob = float(mask.mean()) if len(mask) else 0.0
         cond = float(ends_cond[mask].mean()) if mask.any() else 0.0
-        # Paired (exit premium, forward FX ratio) for every window in this bucket,
-        # so the frontend averages P&L jointly over premium AND FX (E[PnL|band]).
+        # FX-stripped exit premiums for this bucket. The frontend prices the
+        # option leg's moneyness off these with FX held flat (fxRatio = 1); FX
+        # is handled as its own EV line, so FX is never counted twice.
         return {
             "label": label, "prob": prob, "cond_premium": cond,
             "premiums": [round(float(x), 6) for x in ends_cond[mask].tolist()],
-            "fx_ratios": [round(float(x), 6) for x in fx_cond[mask].tolist()],
         }
 
-    C = PREM_THRESHOLD                            # ±5% band around today
-    lo = moves < -C                               # drops >5% below today
-    hi = moves > C                                # rises >5% above today
+    C = PREM_THRESHOLD                            # ±5% band on the FX-stripped basis move
+    lo = db < -C                                  # basis drops >5% below today
+    hi = db > C                                   # basis rises >5% above today
     mid = ~lo & ~hi                               # stays within ±5% of today
     thr = int(C * 100)
     if p0 < 0:
@@ -185,16 +205,24 @@ def adr_premium_scenario(stock_code, horizon_days, period="3y"):
     else:
         lo_lbl, mid_lbl, hi_lbl = (f"Falls ≥{thr}%", f"Stays (±{thr}%)", f"Rises ≥{thr}%")
 
-    # ── FX orthogonalized against premium (how much FX is NOT explained by it) ──
+    # ── Premium decomposed into FX + residual basis (exact identity) ──
+    # rp = daily premium log-move, rf = daily FX log-move. rb = rp − rf is the
+    # residual basis move: the premium change NOT explained by FX (Δln(adr_usd)
+    # − Δln(tw_local), the US-only basis). "unexplained fraction" = share of
+    # premium variance carried by this basis. corr(rp, rf) is how tightly the
+    # premium tracks FX (the scatter's coupling), reported for the chart only.
     rp = np.diff(np.log1p(p))
     rf = np.diff(np.log(F))
-    if rp.std() > 0 and rf.std() > 0:
-        corr = float(np.corrcoef(rp, rf)[0, 1])
-        beta = float(np.cov(rf, rp)[0, 1] / np.var(rp))
-        resid = rf - (rf.mean() + beta * (rp - rp.mean()))
+    rb = rp - rf                               # residual basis daily move (exact)
+    vp = float(np.var(rp))
+    if vp > 0:
+        unexplained = float(np.var(rb) / vp)   # premium variance from the basis (ex-FX)
+        corr = float(np.corrcoef(rp, rf)[0, 1]) if rf.std() > 0 else 0.0
     else:
-        corr, beta, resid = 0.0, 0.0, rf - rf.mean()
-    r2 = corr ** 2                             # shared variance fraction
+        unexplained, corr = 1.0, 0.0
+    unexplained = max(0.0, min(1.0, unexplained))
+    r2 = corr ** 2                             # premium/FX scatter R² (coupling)
+    resid = rb                                 # basis series for the chart (premium ex-FX)
 
     # ── FX factor: condition on windows that STARTED near today's FX level ──
     starts_f = F[: n - k]
@@ -224,9 +252,10 @@ def adr_premium_scenario(stock_code, horizon_days, period="3y"):
         "down_mean_pct": float((fx_cond2[down].mean() - 1) * 100) if down.any() else 0.0,
         # forward FX % move for every FX-conditioned window (for the modal)
         "ratios_pct": [round(float((x - 1) * 100), 4) for x in fx_cond2.tolist()],
-        "r2_with_premium": round(r2, 4),        # coupling of FX & premium moves
+        "r2_with_premium": round(r2, 4),        # premium/FX scatter R² (coupling)
         "corr_with_premium": round(corr, 4),
-        "unexplained_frac": round(1 - r2, 4),   # FX variance NOT explained by premium
+        "unexplained_frac": round(unexplained, 4),   # premium variance NOT explained by FX (basis)
+        "explained_frac": round(1.0 - unexplained, 4),
     }
 
     return {
@@ -256,6 +285,38 @@ def adr_premium_scenario(stock_code, horizon_days, period="3y"):
             "dfx_pct": [round(float(x) * 100, 4) for x in rf.tolist()],
         },
     }
+
+
+def _adf_test(series):
+    """Augmented Dickey-Fuller unit-root test + AR(1) half-life on the premium
+    LEVEL series. ADF null = unit root (random walk, NOT mean-reverting); a low
+    p-value (< 0.05) rejects it => the premium is stationary / mean-reverting,
+    which is the whole thesis of the trade. Half-life = trading days for a
+    premium deviation to decay halfway back to its mean.
+    """
+    x = np.asarray(series, dtype=float)
+    x = x[np.isfinite(x)]
+    out = {"stat": None, "pvalue": None, "nobs": int(len(x)), "usedlag": None,
+           "crit": {}, "half_life": None, "stationary": None}
+    if len(x) < 30:
+        return out
+    try:
+        # Lazy import: statsmodels is heavy on the 512MB host, so keep it out of
+        # module-import cost and degrade gracefully if it isn't installed.
+        from statsmodels.tsa.stattools import adfuller
+        stat, pval, usedlag, nobs, crit, _ = adfuller(x, autolag="AIC")
+    except Exception:
+        return out
+    out.update({"stat": float(stat), "pvalue": float(pval), "usedlag": int(usedlag),
+                "nobs": int(nobs), "crit": {k: float(v) for k, v in crit.items()},
+                "stationary": bool(pval < 0.05)})
+    # AR(1) half-life: Δp_t = a + b·p_{t-1}; mean-revert speed φ = 1 + b (b < 0),
+    # half-life = −ln2 / ln(1 + b). Only defined when the level pulls back (b<0).
+    dp = np.diff(x)
+    b = float(np.polyfit(x[:-1], dp, 1)[0])
+    if b < 0:
+        out["half_life"] = float(-np.log(2) / np.log(1.0 + b))
+    return out
 
 
 def adr_premium_stats(stock_code, period="3y"):
@@ -302,6 +363,7 @@ def adr_premium_stats(stock_code, period="3y"):
         "latest_premium": float(prem.iloc[-1]),
         "mean_premium": float(prem.mean()),
         "std_premium": float(prem.std()),
+        "adf": _adf_test(prem.values),          # unit-root test: is the premium mean-reverting?
         "threshold": PREM_THRESHOLD,
         "dates": [d.strftime("%Y-%m-%d") for d in df.index],
         "premium_pct": [round(float(x) * 100, 3) for x in prem],
@@ -360,7 +422,7 @@ def _live_premium_fx(stock_code):
 
 
 def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
-                     compute_iv=True):
+                     compute_iv=True, keep_noniv=False):
     """Return a DataFrame of UMC options priced in TWD per Taiwan share.
 
     Columns mirror options_logic.fetch_options so the same matching code can
@@ -370,19 +432,50 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
     if stock_code not in US_ADR_MAP:
         raise RuntimeError(f"{stock_code}: no US ADR mapping")
 
+    # Snapshot-first read (MARKET_SOURCE=supabase). The stored snapshot is the
+    # superset-with-IV; compute_iv=True (scanner) drops non-converged-IV rows,
+    # compute_iv=False (arb) keeps the superset. _filter_chain preserves the
+    # raise-on-empty-range contract. Empty snapshot / read error falls through
+    # to the live path below; the supabase path never warms _cache.
+    if db_market.snapshot_enabled():
+        snap = None
+        try:
+            snap, _as_of = db_market.read_snapshot("us_options", codes=[stock_code])
+        except Exception as e:
+            applog.log("USOPT", f"supabase read failed ({e}) — falling back to live")
+            snap = None
+        if snap is not None and not snap.empty:
+            if compute_iv:
+                snap = snap[snap["iv_ask"].notna()]
+            else:
+                # Live compute_iv=False emits NaN IV-derived metrics; blank the
+                # superset's stored values so the arb path (which branches on IV
+                # presence) matches the live arb frame exactly.
+                snap = snap.copy()
+                for _c in ("iv_ask", "iv_bid", "delta_calc"):
+                    if _c in snap.columns:
+                        snap[_c] = np.nan
+            return _filter_chain(snap, option_type, min_days, max_days)
+
     cfg = US_ADR_MAP[stock_code]
     # The cache holds the FULL chain (all types, all expiries); the requested
     # option_type/day-range are filter views applied on the way out, so a
     # background warm-up serves every filter combination.
-    cache_key = (stock_code, compute_iv)
+    cache_key = (stock_code, compute_iv, keep_noniv)
     hit = _cache.get(cache_key)
     if hit and time.time() - hit[0] < _CACHE_TTL:
+        applog.log(
+            "USOPT",
+            f"{stock_code} {cfg['adr_ticker']} cache hit (age {int(time.time() - hit[0])}s)",
+        )
         return _filter_chain(hit[1], option_type, min_days, max_days)
 
+    t0 = time.time()
     adr_ratio = cfg["adr_ratio"]             # ordinary shares per ADR
     adr = _last_price(cfg["adr_ticker"])     # USD per ADR
     fx = _last_price(cfg["fx_ticker"])       # TWD per USD
     if adr <= 0 or fx <= 0:
+        applog.log("USOPT", f"{stock_code} bad ADR price ({adr}) or FX ({fx})")
         raise RuntimeError("bad ADR price or FX")
 
     # Underlying value expressed per Taiwan share, in TWD — the same basis the
@@ -392,10 +485,20 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
     tk = yf.Ticker(cfg["adr_ticker"])
     expiries = tk.options
     if not expiries:
+        applog.log("USOPT", f"{stock_code} {cfg['adr_ticker']} no option expiries")
         raise RuntimeError(f"{cfg['adr_ticker']}: no option expiries")
+
+    # One yfinance round-trip per expiry, so this walk is the slow part; logging
+    # before it starts makes a hang attributable to this stage.
+    applog.log(
+        "USOPT",
+        f"{stock_code} {cfg['adr_ticker']} walking {len(expiries)} expiries "
+        f"(adr={adr} fx={fx})",
+    )
 
     today = pd.Timestamp.now().normalize()
     rows = []
+    failed_exp = 0
     for exp in expiries:
         exp_ts = pd.Timestamp(exp)
         dte = int((exp_ts - today).days)
@@ -404,6 +507,7 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
         try:
             chain = tk.option_chain(exp)
         except Exception:
+            failed_exp += 1
             continue
 
         for is_put, leg in ((False, chain.calls), (True, chain.puts)):
@@ -438,9 +542,13 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
                     if np.isnan(iv_ask) and not np.isnan(iv_bid):
                         iv_ask = iv_bid
                     if np.isnan(iv_ask):
-                        continue
-
-                    delta = bs_delta(adr, K_usd, T, R_US, iv_ask, 1.0, is_put)
+                        # keep_noniv (superset-with-IV mode): keep the row with
+                        # all IV-derived metrics NaN instead of dropping it.
+                        if not keep_noniv:
+                            continue
+                        iv_ask = iv_bid = delta = np.nan
+                    else:
+                        delta = bs_delta(adr, K_usd, T, R_US, iv_ask, 1.0, is_put)
                 else:
                     # Arb finder does not use IV/delta — skip the solve so an
                     # option is never dropped just because IV wouldn't converge.
@@ -476,8 +584,19 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
                 })
 
     if not rows:
+        applog.log(
+            "USOPT",
+            f"{stock_code} {cfg['adr_ticker']} -> 0 contracts from "
+            f"{len(expiries)} expiries in {time.time() - t0:.1f}s",
+        )
         raise RuntimeError("no US options in range")
 
+    applog.log(
+        "USOPT",
+        f"{stock_code} {cfg['adr_ticker']} fetched {len(rows)} contracts from "
+        f"{len(expiries)} expiries in {time.time() - t0:.1f}s"
+        + (f" ({failed_exp} expiries failed)" if failed_exp else ""),
+    )
     df = pd.DataFrame(rows).sort_values(["days_to_expiry", "strike"]).reset_index(drop=True)
     _cache[cache_key] = (time.time(), df.copy())
     return _filter_chain(df, option_type, min_days, max_days)
