@@ -73,6 +73,37 @@ _cmoney_key = None
 _cmoney_key_fetch_lock = threading.Lock()
 
 
+# ── Work-phase tracker ───────────────────────────────────────────────────────
+# Best-effort "what is the server doing right now" label for the fetch/refresh
+# progress line. Process-global (one worker, in-process caches), so with
+# concurrent requests the newest write wins — acceptable for a status hint. The
+# frontend polls /fetch_status while a fetch/refresh is in flight and shows the
+# label. Phases age out so a crashed op never pins a stale label.
+_phase = {"label": None, "ts": 0.0}
+_phase_lock = threading.Lock()
+PHASE_STALE_SECONDS = 120
+
+
+def set_phase(label):
+    with _phase_lock:
+        _phase["label"] = label
+        _phase["ts"] = time.time()
+
+
+def clear_phase():
+    with _phase_lock:
+        _phase["label"] = None
+        _phase["ts"] = time.time()
+
+
+def current_phase():
+    with _phase_lock:
+        label = _phase["label"]
+        if label and time.time() - _phase["ts"] > PHASE_STALE_SECONDS:
+            label = None
+        return {"phase": label}
+
+
 def bs_price(S, K, T, r, sigma, ratio, is_put=False):
     if T <= 0 or sigma <= 0:
         return 0.0
@@ -137,6 +168,7 @@ def _fetch_key_locked():
     """Fetch and store the key. Caller must hold _cmoney_key_fetch_lock."""
     global _cmoney_key
     print("KEY: fetching cmkey", flush=True)
+    set_phase("Fetching CMoney access key…")
     try:
         _cmoney_key = _fetch_cmoney_key_http()
         # Truncated: the key is a credential, but its prefix identifies which key
@@ -306,6 +338,8 @@ def probe_cmoney():
 
 
 def build_warrant_df(cmoney_results, compute_iv=True, keep_noniv=False):
+    if compute_iv:
+        set_phase("Computing implied volatility…")
     r_free_default = 0.02
     rows = []
 
@@ -768,6 +802,7 @@ def get_warrant_results(stock_codes, force=False):
         applog.log("WARR", f"{sc} cache hit (age {age}s)")
     if need:
         with memlog.measure("warrants_fetch"):
+            set_phase("Resolving warrant codes…")
             code_map = _warrant_codes_for(need)
             all_codes = sorted({c for cs in code_map.values() for c in cs})
             applog.log(
@@ -776,6 +811,7 @@ def get_warrant_results(stock_codes, force=False):
                 f"{' (forced)' if force else ''}",
             )
             t0 = time.time()
+            set_phase(f"Scraping {len(all_codes)} warrant prices from CMoney…")
             fetched = get_cmoney_prices(all_codes) if all_codes else {}
             applog.log(
                 "WARR",
@@ -868,6 +904,7 @@ def fetch_warrants(
     min_volume=0,
     compute_iv=True,
     keep_noniv=False,
+    live_only=False,
 ):
     if isinstance(stock_codes, str):
         stock_codes = [stock_codes]
@@ -876,8 +913,15 @@ def fetch_warrants(
     # superset-with-IV; compute_iv=True (scanner) drops non-converged-IV rows to
     # reproduce the live scanner set, compute_iv=False (arb) keeps the superset.
     # Any error / empty snapshot falls through to the live path below.
-    if db_market.snapshot_enabled():
+    #
+    # live_only bypasses this read entirely. The snapshot WRITER (scheduler /
+    # /refresh -> refresh_warrants) runs in the same process where
+    # MARKET_SOURCE=supabase, so without this flag it would read the existing
+    # snapshot and write it straight back — never scraping fresh CMoney prices.
+    # The writer sets live_only=True so a refresh always pulls live and repopulates.
+    if db_market.snapshot_enabled() and not live_only:
         try:
+            set_phase("Loading market data from database…")
             snap, as_of = db_market.read_snapshot("warrants", codes=stock_codes)
             if snap is not None and not snap.empty:
                 meta = {"as_of": as_of, "cached": True}

@@ -183,12 +183,15 @@ def refresh_warrants():
     """Fetch the full warrant superset (IV computed, non-converged kept) + write."""
     df, err, meta = warrant_logic.fetch_warrants(
         warrant_universe(), "All", 0, 365, 0.0, 1e9, 0,
-        compute_iv=True, keep_noniv=True,
+        compute_iv=True, keep_noniv=True, live_only=True,
     )
     if df is None or df.empty:
         print(f"SCHED: warrants empty ({err}), skipping write", flush=True)
+        warrant_logic.clear_phase()
         return
+    warrant_logic.set_phase(f"Saving {len(df)} warrants to database…")
     db_market.write_snapshot("warrants", df)
+    warrant_logic.clear_phase()
 
 
 def refresh_tw_options():

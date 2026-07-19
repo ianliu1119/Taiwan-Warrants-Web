@@ -96,6 +96,29 @@ setInterval(_tickAges, 30000);
 // snapshot's as_of advances (so the table auto-updates when the scrape lands)
 // or a 60s cap elapses. Always re-enables the button, even on error.
 
+// Poll /fetch_status while `active()` is true, writing the server's current
+// work phase (loading from DB, fetching cmkey, scraping CMoney, computing IV,
+// saving) into statusEl so the user sees which step a fetch/refresh is on.
+// Best-effort: falls back to fallbackText when the server reports no phase, and
+// silently stops on error or when active() goes false. Returns a stop()
+// function so the caller can end polling before writing its final status.
+function pollPhase(statusEl, active, fallbackText) {
+  if (!statusEl) return () => {};
+  let stopped = false;
+  (async function loop() {
+    while (!stopped && active()) {
+      let phase = null;
+      try {
+        phase = (await (await fetch("/fetch_status")).json()).phase;
+      } catch (e) { /* transient — keep polling */ }
+      if (stopped || !active()) break;
+      statusEl.textContent = phase || fallbackText;
+      await new Promise(r => setTimeout(r, 800));
+    }
+  })();
+  return () => { stopped = true; };
+}
+
 async function refreshNow(kind, statusEl, btn, onDone) {
   if (!statusEl || !btn) return;
   const origLabel = btn.textContent;
@@ -109,6 +132,10 @@ async function refreshNow(kind, statusEl, btn, onDone) {
   btn.disabled = true;
   btn.textContent = "Refreshing…";
   statusEl.textContent = "Refreshing market data… (up to ~30s)";
+  // Surface the background refresh's live step (scraping CMoney, computing IV,
+  // saving…) while we wait for the new snapshot to land.
+  let waiting = true;
+  const stopPhase = pollPhase(statusEl, () => waiting, "Refreshing market data…");
   try {
     const res = await api("/refresh", {
       method: "POST",
@@ -131,6 +158,8 @@ async function refreshNow(kind, statusEl, btn, onDone) {
   } catch (e) {
     statusEl.textContent = "Refresh failed: " + (e && e.message ? e.message : e);
   } finally {
+    waiting = false;
+    stopPhase();
     btn.disabled = wasDisabled;
     btn.textContent = origLabel;
   }

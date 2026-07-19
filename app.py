@@ -475,6 +475,15 @@ def universe_status():
     return jsonify(warrant_logic.universe_status())
 
 
+@app.route("/fetch_status")
+def fetch_status():
+    # Best-effort "what is the server doing" label, polled by the frontend while
+    # a fetch/refresh is in flight so the user sees the current step (loading
+    # from DB, fetching cmkey, scraping CMoney, computing IV, saving). Returns
+    # {"phase": null} when idle.
+    return jsonify(warrant_logic.current_phase())
+
+
 @app.route("/health/cmoney")
 def health_cmoney():
     # Unauthenticated so an external uptime monitor (UptimeRobot, Render cron,

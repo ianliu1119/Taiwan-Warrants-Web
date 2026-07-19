@@ -105,16 +105,27 @@ async function fetchData() {
     document.getElementById("status").textContent = "Please select at least one stock.";
     return;
   }
-  document.getElementById("status").textContent = "Fetching…";
+  const statusEl = document.getElementById("status");
+  statusEl.textContent = "Fetching…";
   document.getElementById("tableContainer").innerHTML = "";
   document.getElementById("downloadBtn").style.display = "none";
 
-  const res = await api("/fetch", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(filters),
-  });
-  const data = await res.json();
+  // Show the server's current step (loading from DB, or on a live fallback:
+  // scraping CMoney, computing IV…) while the request is in flight.
+  let inFlight = true;
+  const stopPhase = pollPhase(statusEl, () => inFlight, "Fetching…");
+  let data;
+  try {
+    const res = await api("/fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(filters),
+    });
+    data = await res.json();
+  } finally {
+    inFlight = false;
+    stopPhase();
+  }
   currentData = data.rows;
   setStatusWithAge("warrants", "status", `${data.count} warrants`, data);
   document.getElementById("downloadBtn").style.display = "inline-block";

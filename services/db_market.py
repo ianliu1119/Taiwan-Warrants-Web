@@ -39,11 +39,17 @@ def _now():
 
 
 def _records(df, batch_id):
-    """DataFrame -> list of JSON-safe records with batch_id attached.
+    """DataFrame slice -> list of JSON-safe records with batch_id attached.
 
     NaN/NaT must become None: supabase-py serializes to JSON and a bare NaN is
     not valid JSON (and 'nan' as a string would corrupt the column). astype
     (object).where(notnull, None) replaces every missing cell with None.
+
+    Call this per INSERT chunk, not on the whole frame: astype(object) plus
+    to_dict each materialize a full copy, so converting all rows at once triples
+    peak memory over a large snapshot (the ~140MB universe-write spike that
+    pushed the 512MB Render instance into an OOM restart). A 500-row slice caps
+    that transient flat regardless of total row count.
     """
     clean = df.astype(object).where(pd.notnull(df), None)
     records = clean.to_dict(orient="records")
@@ -62,10 +68,13 @@ def write_snapshot(category, df):
     table, _code_col = _CATEGORY[category]
     batch_id = str(uuid.uuid4())
 
-    # 1. INSERT the new batch, chunked so no single request is oversized.
-    records = _records(df, batch_id)
-    for i in range(0, len(records), _INSERT_CHUNK):
-        chunk = records[i:i + _INSERT_CHUNK]
+    # 1. INSERT the new batch, chunked so no single request is oversized AND so
+    # the object-dtype/to_dict conversion only ever holds one chunk in memory
+    # (see _records: converting the whole frame at once is the universe-write
+    # memory spike). Slice the frame, convert just that slice, insert, discard.
+    n = len(df)
+    for i in range(0, n, _INSERT_CHUNK):
+        chunk = _records(df.iloc[i:i + _INSERT_CHUNK], batch_id)
         db._run(lambda c, chunk=chunk: c.table(table).insert(chunk).execute())
 
     # 2. SWAP POINTER — this upsert is the atomic commit of the new batch.
