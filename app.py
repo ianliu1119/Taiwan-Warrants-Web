@@ -40,9 +40,12 @@ app.json.sort_keys = False
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.jinja_env.auto_reload = True
 
-# Render pings /healthz constantly; static assets are noise too. Neither says
-# anything about what the app is doing, so they stay out of the log.
-_LOG_SKIP_PATHS = {"/healthz", "/favicon.ico"}
+# Render pings /healthz constantly; static assets are noise too. The two poll
+# endpoints are hit once a second while a progress bar is up, and the work they
+# report on (universe build, fetch phase) logs its own progress separately, so
+# their REQ lines add only noise. Neither says anything about what the app is
+# doing, so they stay out of the log.
+_LOG_SKIP_PATHS = {"/healthz", "/favicon.ico", "/universe_status", "/fetch_status"}
 # Params worth a completion line's worth of context, in the order they read best.
 _LOG_PARAMS = ("stock_codes", "option_type", "strategy", "kind", "period")
 # The paths are historical and say nothing about the work behind them (/fetch is
@@ -103,10 +106,15 @@ def _log_request_start():
         return
     g.log_id = applog.new_id()
     g.log_t0 = time.time()
-    applog.log(
-        "REQ",
-        f"{request.method} {request.path}{_route_label()} start{_param_summary()}",
-    )
+    # The "start" line only earns its place for the heavy, in-flight operations
+    # (the data POSTs like /fetch, /refresh) where seeing the request begin —
+    # before it completes — is useful. GET reads finish in milliseconds, so
+    # their start line just doubles the completion line; log completion only.
+    if request.method != "GET":
+        applog.log(
+            "REQ",
+            f"{request.method} {request.path}{_route_label()} start{_param_summary()}",
+        )
 
 
 def _log_request_end(status):
