@@ -24,7 +24,7 @@ import yfinance as yf
 
 from services import applog
 from services import db_market
-from logic.warrant_logic import implied_vol, bs_delta, calc_real_leverage
+from logic.warrant_logic import implied_vol, bs_delta, calc_real_leverage, set_phase
 
 # One US option contract covers 100 ADRs. The number of ordinary (Taiwan)
 # shares per ADR ("adr_ratio") is per-listing, so contract size in Taiwan
@@ -440,6 +440,7 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
     if db_market.snapshot_enabled():
         snap = None
         try:
+            set_phase("Loading market data from database…")
             snap, _as_of = db_market.read_snapshot("us_options", codes=[stock_code])
         except Exception as e:
             applog.log("USOPT", f"supabase read failed ({e}) — falling back to live")
@@ -470,6 +471,7 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
         )
         return _filter_chain(hit[1], option_type, min_days, max_days)
 
+    set_phase("Fetching US ADR option chain (Yahoo)…")
     t0 = time.time()
     adr_ratio = cfg["adr_ratio"]             # ordinary shares per ADR
     adr = _last_price(cfg["adr_ticker"])     # USD per ADR

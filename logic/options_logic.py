@@ -8,7 +8,7 @@ import numpy as np
 import yfinance as yf
 from services import applog
 from services import db_market
-from logic.warrant_logic import implied_vol, bs_delta, calc_real_leverage
+from logic.warrant_logic import implied_vol, bs_delta, calc_real_leverage, set_phase
 
 R = 0.01875  # Taiwan CBC benchmark rate
 
@@ -551,6 +551,7 @@ def fetch_options(
     if db_market.snapshot_enabled():
         snap = None
         try:
+            set_phase("Loading market data from database…")
             snap, _as_of = db_market.read_snapshot("tw_options", codes=list(stock_codes))
         except Exception as e:
             applog.log("OPT", f"supabase read failed ({e}) — falling back to live")
@@ -573,6 +574,7 @@ def fetch_options(
                 raise RuntimeError("No data returned")
             return result
 
+    set_phase("Fetching TW option quotes…")
     dfs = []
     errors = []
     for code in stock_codes:
