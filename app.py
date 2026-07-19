@@ -475,6 +475,18 @@ def universe_status():
     return jsonify(warrant_logic.universe_status())
 
 
+@app.route("/health/cmoney")
+def health_cmoney():
+    # Unauthenticated so an external uptime monitor (UptimeRobot, Render cron,
+    # a /loop) can poll it. One round-trip to CMoney; always 200 so the JSON
+    # body carries the verdict rather than an HTTP error. ok=False with
+    # error=ConnectTimeout means CMoney is unreachable from this host (the
+    # Render IP-block case); a large ms with ok=True means up-but-slow.
+    result = warrant_logic.probe_cmoney()
+    applog.log("HEALTH", f"cmoney probe {result}")
+    return jsonify(result)
+
+
 @app.route("/adr_premium", methods=["POST"])
 @require_auth
 def adr_premium():

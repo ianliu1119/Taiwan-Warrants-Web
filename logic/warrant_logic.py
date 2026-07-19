@@ -217,18 +217,29 @@ def fetch_one_cmoney(code, cmkey):
             return code, data
         if data.get("Error") == -3:
             return code, "KEY_EXPIRED"
+        # Reachable, valid JSON, but no warrant payload (e.g. delisted code).
+        return code, "NO_DATA"
+    except requests.exceptions.ConnectTimeout:
+        return code, "CONN_TIMEOUT"
+    except (requests.exceptions.ReadTimeout, requests.exceptions.Timeout):
+        return code, "READ_TIMEOUT"
+    except requests.exceptions.ConnectionError:
+        return code, "CONN_ERROR"
     except Exception:
-        pass
-    return code, None
+        return code, "ERR"
 
 
-def get_cmoney_prices(codes):
-    global _cmoney_key
-    cmkey = get_cmoney_key()
+# Sentinel strings returned by fetch_one_cmoney for non-success outcomes.
+_CMONEY_SENTINELS = {
+    "KEY_EXPIRED", "NO_DATA", "CONN_TIMEOUT", "READ_TIMEOUT", "CONN_ERROR", "ERR",
+}
 
+
+def _run_cmoney_batch(codes, cmkey):
+    """Fan out over codes; return (results, key_expired, fail_counts)."""
     results = {}
     key_expired = False
-
+    fail_counts = {}
     with ThreadPoolExecutor(max_workers=100) as executor:
         futures = {
             executor.submit(fetch_one_cmoney, code, cmkey): code for code in codes
@@ -237,30 +248,61 @@ def get_cmoney_prices(codes):
             code, data = future.result()
             if data == "KEY_EXPIRED":
                 key_expired = True
+            elif isinstance(data, str) and data in _CMONEY_SENTINELS:
+                fail_counts[data] = fail_counts.get(data, 0) + 1
             elif data is not None:
                 results[code] = data
+    return results, key_expired, fail_counts
+
+
+def get_cmoney_prices(codes):
+    global _cmoney_key
+    cmkey = get_cmoney_key()
+
+    t0 = time.time()
+    results, key_expired, fail_counts = _run_cmoney_batch(codes, cmkey)
 
     if key_expired:
         applog.log("WARR", f"cmkey expired (Error -3) — refreshing key, retrying {len(codes)} codes")
         cmkey = refresh_cmoney_key()
-        results = {}
-        with ThreadPoolExecutor(max_workers=100) as executor:
-            futures = {
-                executor.submit(fetch_one_cmoney, code, cmkey): code for code in codes
-            }
-            for future in as_completed(futures):
-                code, data = future.result()
-                if data and data != "KEY_EXPIRED":
-                    results[code] = data
+        results, _, fail_counts = _run_cmoney_batch(codes, cmkey)
+
+    elapsed = time.time() - t0
 
     # Aggregate only: fetch_one_cmoney fans out over 100 threads, so a per-code
-    # failure line would be thousands of lines for one request.
+    # failure line would be thousands of lines for one request. The failure
+    # breakdown distinguishes "CMoney unreachable/blocked" (conn_timeout /
+    # conn_error dominate) from "CMoney up but slow" (read_timeout) from benign
+    # "no warrants for this code" (no_data).
+    breakdown = " ".join(
+        f"{k.lower()}={v}" for k, v in sorted(fail_counts.items())
+    )
+    failed = len(codes) - len(results)
     applog.log(
         "WARR",
-        f"cmoney {len(codes)} requested, {len(results)} ok, "
-        f"{len(codes) - len(results)} failed",
+        f"cmoney {len(codes)} requested, {len(results)} ok, {failed} failed "
+        f"in {elapsed:.1f}s" + (f" ({breakdown})" if breakdown else ""),
     )
     return results
+
+
+def probe_cmoney():
+    """One lightweight round-trip to CMoney for health monitoring.
+
+    Returns a dict describing reachability and latency. Never raises — a
+    failure is reported as ok=False with the exception class name, so a
+    monitor polling this endpoint sees down-vs-slow rather than a 500.
+    """
+    t0 = time.time()
+    try:
+        r = requests.get(
+            CMONEY_KEY_PAGE, headers=CMONEY_HEADERS, verify=False, timeout=10
+        )
+        ms = int((time.time() - t0) * 1000)
+        return {"ok": r.status_code == 200, "status": r.status_code, "ms": ms}
+    except Exception as e:
+        ms = int((time.time() - t0) * 1000)
+        return {"ok": False, "error": type(e).__name__, "ms": ms}
 
 
 def build_warrant_df(cmoney_results, compute_iv=True, keep_noniv=False):
