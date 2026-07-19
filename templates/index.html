@@ -17,7 +17,7 @@
     </header>
 
     <style>
-      #market-clock{position:fixed;right:14px;bottom:14px;z-index:900;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:9px 11px;font-size:11px;color:var(--muted);box-shadow:0 4px 16px rgba(0,0,0,.35);min-width:150px;user-select:none}
+      #market-clock{position:fixed;right:14px;bottom:14px;z-index:900;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:9px 11px;font-size:11px;color:var(--muted);box-shadow:0 4px 16px rgba(0,0,0,.35);min-width:190px;user-select:none}
       #market-clock .mc-clocks{display:flex;justify-content:space-between;gap:10px;margin-bottom:7px;padding-bottom:6px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
       #market-clock .mc-clocks b{color:var(--text);font-size:12px;font-weight:700}
       #market-clock .mc-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:2px 0}
@@ -46,6 +46,7 @@
     <div id="market-clock" title="Local exchange time + current session">
       <div class="mc-clocks">
         <span><b id="mc-ny-time">--:--</b> ET</span>
+        <span><b id="mc-pt-time">--:--</b> PT</span>
         <span><b id="mc-tw-time">--:--</b> TPE</span>
       </div>
       <div class="mc-row"><span class="mc-lbl">NYSE</span><span class="mc-badge mc-closed" id="mc-ny-st">–</span></div>

@@ -278,8 +278,10 @@ function _mcSet(id, txt, cls) {
   e.textContent = txt; e.className = "mc-badge " + cls;
 }
 function updateMarketClock() {
-  const et = _tzParts("America/New_York"), tp = _tzParts("Asia/Taipei");
+  const et = _tzParts("America/New_York"), tp = _tzParts("Asia/Taipei"),
+        pt = _tzParts("America/Los_Angeles");
   document.getElementById("mc-ny-time").textContent = et.str;
+  document.getElementById("mc-pt-time").textContent = pt.str;
   document.getElementById("mc-tw-time").textContent = tp.str;
   const nyWknd = et.wd === "Sat" || et.wd === "Sun", nt = et.mins;
   // NYSE: pre 04:00–09:30, regular 09:30–16:00, after 16:00–20:00
