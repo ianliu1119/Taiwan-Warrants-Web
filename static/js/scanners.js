@@ -128,6 +128,7 @@ async function fetchData(opts) {
     document.getElementById("downloadBtn").style.display = "none";
   }
   let data;
+  const t0 = performance.now();
   try {
     const res = await api("/fetch", {
       method: "POST",
@@ -147,8 +148,9 @@ async function fetchData(opts) {
   // Superseded while the request was in flight: don't paint stale results.
   if (!opIsCurrent(op.seq)) return data;
   if (!quiet) {
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
     currentData = data.rows;
-    setStatusWithAge("warrants", "status", `${data.count} warrants`, data);
+    setStatusWithAge("warrants", "status", `${data.count} warrants (${secs}s)`, data);
     document.getElementById("downloadBtn").style.display = "inline-block";
     renderTable(currentData);
   }
@@ -244,6 +246,7 @@ async function fetchIVSurfaceOptions() {
     option_type: document.getElementById("ivOptType").value,
   };
   let data;
+  const t0 = performance.now();
   try {
     const res = await api("/iv_surface_options", {
       method: "POST",
@@ -261,7 +264,8 @@ async function fetchIVSurfaceOptions() {
   }
   const product = document.getElementById("ivOptProduct").options[document.getElementById("ivOptProduct").selectedIndex].text;
   const callPut = document.getElementById("ivOptType").value;
-  document.getElementById("iv-status").textContent = `${data.scatter_x.length} contracts plotted`;
+  const secs = ((performance.now() - t0) / 1000).toFixed(1);
+  document.getElementById("iv-status").textContent = `${data.scatter_x.length} contracts plotted (${secs}s)`;
   const traces = [
     {
       type: "surface",
@@ -313,6 +317,7 @@ async function fetchIVSurface() {
     highlight_code: document.getElementById("highlightCode").value.trim(),
   };
 
+  const t0 = performance.now();
   const res = await api("/iv_surface", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -325,7 +330,8 @@ async function fetchIVSurface() {
     return;
   }
 
-  document.getElementById("iv-status").textContent = `${data.scatter_x.length} warrants plotted`;
+  const secs = ((performance.now() - t0) / 1000).toFixed(1);
+  document.getElementById("iv-status").textContent = `${data.scatter_x.length} warrants plotted (${secs}s)`;
 
   const traces = [
     {
@@ -426,6 +432,7 @@ async function fetchOptionsData(opts) {
     document.getElementById("optDownloadBtn").style.display = "none";
   }
   let data;
+  const t0 = performance.now();
   try {
     const res = await api(_optMarket === "us" ? "/us_options" : "/fetch_options", {
       method: "POST",
@@ -445,8 +452,9 @@ async function fetchOptionsData(opts) {
     return data;
   }
   if (!quiet) {
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
     currentOptionsData = data.rows;
-    setStatusWithAge("options", "opt-status", `${data.count} options`, data);
+    setStatusWithAge("options", "opt-status", `${data.count} options (${secs}s)`, data);
     document.getElementById("optDownloadBtn").style.display = "inline-block";
     renderOptionsTable(currentOptionsData);
   }

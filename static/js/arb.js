@@ -57,6 +57,7 @@ async function fetchUsData() {
   document.getElementById("us-tableContainer").innerHTML = "";
   document.getElementById("usDownloadBtn").style.display = "none";
   let data;
+  const t0 = performance.now();
   try {
     const res = await api("/us_option_match", {
       method: "POST",
@@ -73,10 +74,11 @@ async function fetchUsData() {
     return;
   }
   currentUsData = data.rows;
+  const secs = ((performance.now() - t0) / 1000).toFixed(1);
   const usPcp = document.getElementById("usStrategy").value === "pcp";
   document.getElementById("us-status").textContent = usPcp
-    ? `${data.count} cross-market PCP pairs — executable: long warrant / short synthetic (short US opp-type option + short/long ADR + USD bond); non-executable (debug): short warrant. Prices TWD/TW-share; 1 US contract = 500 TW shares; FX held constant`
-    : `${data.count} matched pairs — prices in TWD/Taiwan-share; 1 US contract = 500 TW shares; FX held constant`;
+    ? `${data.count} cross-market PCP pairs (${secs}s) — executable: long warrant / short synthetic (short US opp-type option + short/long ADR + USD bond); non-executable (debug): short warrant. Prices TWD/TW-share; 1 US contract = 500 TW shares; FX held constant`
+    : `${data.count} matched pairs (${secs}s) — prices in TWD/Taiwan-share; 1 US contract = 500 TW shares; FX held constant`;
   document.getElementById("usDownloadBtn").style.display = "inline-block";
   renderUsTable(currentUsData);
 }
@@ -212,6 +214,7 @@ async function fetchTwUsData() {
   document.getElementById("twus-tableContainer").innerHTML = "";
   document.getElementById("twusDownloadBtn").style.display = "none";
   let data;
+  const t0 = performance.now();
   try {
     const res = await api("/tw_us_option_match", {
       method: "POST",
@@ -228,8 +231,9 @@ async function fetchTwUsData() {
     return;
   }
   currentTwUsData = data.rows;
+  const secs = ((performance.now() - t0) / 1000).toFixed(1);
   document.getElementById("twus-status").textContent =
-    `${data.count} matched pairs — entry credit = sell the richer leg / buy the cheaper. Click a row for the ADR-premium scenario P&L.`;
+    `${data.count} matched pairs (${secs}s) — entry credit = sell the richer leg / buy the cheaper. Click a row for the ADR-premium scenario P&L.`;
   document.getElementById("twusDownloadBtn").style.display = "inline-block";
   renderTwUsTable(currentTwUsData);
 }
@@ -726,6 +730,7 @@ async function fetchArbData() {
   document.getElementById("arb-tableContainer").innerHTML = "";
   document.getElementById("arbDownloadBtn").style.display = "none";
   let data;
+  const t0 = performance.now();
   try {
     const res = await api("/arb_finder", {
       method: "POST",
@@ -742,10 +747,11 @@ async function fetchArbData() {
     return;
   }
   currentArbData = data.rows;
+  const secs = ((performance.now() - t0) / 1000).toFixed(1);
   const pcp = document.getElementById("arbStrategy").value === "pcp";
   document.getElementById("arb-status").textContent = (pcp
-    ? `${data.count} PCP pairs — executable: long warrant / short synthetic; non-executable (debug): short warrant / long synthetic`
-    : `${data.count} matched pairs — positive price_diff: buy warrant / sell option; negative: buy option / sell warrant`) + asOfLabel(data);
+    ? `${data.count} PCP pairs (${secs}s) — executable: long warrant / short synthetic; non-executable (debug): short warrant / long synthetic`
+    : `${data.count} matched pairs (${secs}s) — positive price_diff: buy warrant / sell option; negative: buy option / sell warrant`) + asOfLabel(data);
   document.getElementById("arbDownloadBtn").style.display = "inline-block";
   renderArbTable(currentArbData);
 }

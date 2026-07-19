@@ -15,13 +15,14 @@ one complete batch (old or new), never an empty or half-written one.
 This module MAY import pandas (it is a market-data module).
 """
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import pandas as pd
 
-from services import db
+from services import applog, db
 
 # category -> (table name, code column for the read/delete filter, ORDER-BY
 # columns for deterministic pagination). The md_* tables have NO single-column
@@ -75,15 +76,18 @@ def write_snapshot(category, df):
     """
     table, _code_col, _order_cols = _CATEGORY[category]
     batch_id = str(uuid.uuid4())
+    t0 = time.perf_counter()
 
     # 1. INSERT the new batch, chunked so no single request is oversized AND so
     # the object-dtype/to_dict conversion only ever holds one chunk in memory
     # (see _records: converting the whole frame at once is the universe-write
     # memory spike). Slice the frame, convert just that slice, insert, discard.
     n = len(df)
+    chunks = 0
     for i in range(0, n, _INSERT_CHUNK):
         chunk = _records(df.iloc[i:i + _INSERT_CHUNK], batch_id)
         db._run(lambda c, chunk=chunk: c.table(table).insert(chunk).execute())
+        chunks += 1
 
     # 2. SWAP POINTER — this upsert is the atomic commit of the new batch.
     db._run(
@@ -98,6 +102,10 @@ def write_snapshot(category, df):
     # 3. DELETE-OLD — everything in this table that is not the new batch.
     db._run(
         lambda c: c.table(table).delete().neq("batch_id", batch_id).execute()
+    )
+    applog.log(
+        "DB",
+        f"{category} wrote {n} rows in {time.perf_counter() - t0:.1f}s ({chunks} chunks)",
     )
     return batch_id
 
@@ -123,6 +131,7 @@ def read_snapshot(category, codes=None):
     the returned frame is positionally deterministic.
     """
     table, code_col, order_cols = _CATEGORY[category]
+    t0 = time.perf_counter()
 
     ptr = db._run(
         lambda c: c.table("md_batches")
@@ -161,20 +170,22 @@ def read_snapshot(category, codes=None):
     rows = list(first.data or [])
     page_size = len(rows)   # the EFFECTIVE server page size (capped, not _READ_PAGE)
     total = first.count     # exact row count for this batch + codes filter
+    pages = 1               # round-trips made (page 1 above); grows below
 
     if page_size and total and total > page_size:
         # 2. Fetch every remaining range concurrently, then assemble in offset
         # order so the frame stays positionally deterministic. Page size is the
         # measured server cap, so range windows never exceed it (no truncation).
         offsets = list(range(page_size, total, page_size))
-        pages = {}
+        pages += len(offsets)
+        by_offset = {}
         with ThreadPoolExecutor(max_workers=min(_READ_WORKERS, len(offsets))) as ex:
             futures = {ex.submit(fetch, off, page_size): off for off in offsets}
             for fut in as_completed(futures):
                 off = futures[fut]
-                pages[off] = fut.result().data or []
+                by_offset[off] = fut.result().data or []
         for off in offsets:
-            rows.extend(pages[off])
+            rows.extend(by_offset[off])
     elif page_size and total is None:
         # Fallback: count unavailable. Page sequentially and break on the MEASURED
         # page size — never on _READ_PAGE — so a server cap below _READ_PAGE can
@@ -182,6 +193,7 @@ def read_snapshot(category, codes=None):
         offset = page_size
         while True:
             page = fetch(offset, page_size)
+            pages += 1
             batch = page.data or []
             rows.extend(batch)
             if len(batch) < page_size:
@@ -191,6 +203,10 @@ def read_snapshot(category, codes=None):
     df = pd.DataFrame(rows)
     if not df.empty and "batch_id" in df.columns:
         df = df.drop(columns=["batch_id"])
+    applog.log(
+        "DB",
+        f"{category} read {len(df)} rows in {time.perf_counter() - t0:.1f}s ({pages} pages)",
+    )
     return df, created_at
 
 

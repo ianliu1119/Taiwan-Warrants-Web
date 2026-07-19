@@ -134,6 +134,10 @@ setInterval(_tickAges, 30000);
 function pollPhase(statusEl, active, fallbackText) {
   if (!statusEl) return () => {};
   let stopped = false;
+  // This poll loop's own start time — the live elapsed shown next to the phase.
+  // A fresh pollPhase (one per fetch/refresh) resets it, so each operation
+  // counts up from zero.
+  const t0 = performance.now();
   (async function loop() {
     while (!stopped && active()) {
       let phase = null;
@@ -141,7 +145,8 @@ function pollPhase(statusEl, active, fallbackText) {
         phase = (await (await fetch("/fetch_status")).json()).phase;
       } catch (e) { /* transient — keep polling */ }
       if (stopped || !active()) break;
-      statusEl.textContent = phase || fallbackText;
+      const secs = Math.floor((performance.now() - t0) / 1000);
+      statusEl.textContent = (phase || fallbackText) + ` (${secs}s)`;
       await new Promise(r => setTimeout(r, 800));
     }
   })();
