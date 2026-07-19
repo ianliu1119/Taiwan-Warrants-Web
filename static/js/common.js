@@ -53,6 +53,35 @@ async function api(url, opts) {
   return res;
 }
 
+// ── Single-operation guard ───────────────────────────────────────────
+// Only one fetch/refresh may own the UI at a time. Starting a new operation
+// (or switching tab) aborts the previous one so its in-flight request is
+// cancelled and its polling loops stop — no two heavy operations pile up, and
+// a superseded op never renders stale results over the new one.
+//
+// Two mechanisms together: an AbortController cancels the network request, and
+// a monotonic sequence number lets already-running async loops (phase pollers,
+// the refresh wait loop) notice they are no longer current and bail. A caller
+// begins an op, then passes its {seq, signal} down so sub-requests (e.g. the
+// refresh poll's quiet fetches) share the same op instead of starting new ones.
+let _activeAbort = null;
+let _opSeq = 0;
+
+function beginOp() {
+  if (_activeAbort) _activeAbort.abort();
+  _activeAbort = new AbortController();
+  return { seq: ++_opSeq, signal: _activeAbort.signal };
+}
+
+function opIsCurrent(seq) {
+  return seq === _opSeq;
+}
+
+function cancelActiveOp() {
+  if (_activeAbort) { _activeAbort.abort(); _activeAbort = null; }
+  _opSeq++;   // invalidate any loop still checking the old seq
+}
+
 // "updated N min ago" suffix for scanner status lines, from the
 // as_of/cached fields the backend attaches to cached market data.
 
@@ -119,8 +148,16 @@ function pollPhase(statusEl, active, fallbackText) {
   return () => { stopped = true; };
 }
 
-async function refreshNow(kind, statusEl, btn, onDone) {
+// While a refresh runs, the table is NOT re-rendered on every poll. The DB rows
+// don't change until the background writer swaps the snapshot pointer at the
+// end, so re-drawing every 4s just blanks and repaints identical data. Instead
+// we clear the table once, show only the live phase messages, poll QUIETLY
+// (fetch just to read as_of, no render), and render the table a single time
+// once fresh data has landed. clearTable/renderFinal let each tab plug in its
+// own table handling while refreshNow owns the wait/poll/phase logic.
+async function refreshNow(kind, statusEl, btn, onDone, clearTable) {
   if (!statusEl || !btn) return;
+  const op = beginOp();
   const origLabel = btn.textContent;
   const wasDisabled = btn.disabled;
   // Pre-refresh as_of, read from the last stored fetch for this status line.
@@ -132,15 +169,20 @@ async function refreshNow(kind, statusEl, btn, onDone) {
   btn.disabled = true;
   btn.textContent = "Refreshing…";
   statusEl.textContent = "Refreshing market data… (up to ~30s)";
+  // Hide the stale table for the duration — only phase messages show until the
+  // fresh snapshot is pulled and rendered once at the end.
+  if (typeof clearTable === "function") clearTable();
   // Surface the background refresh's live step (scraping CMoney, computing IV,
   // saving…) while we wait for the new snapshot to land.
   let waiting = true;
-  const stopPhase = pollPhase(statusEl, () => waiting, "Refreshing market data…");
+  const stopPhase = pollPhase(statusEl, () => waiting && opIsCurrent(op.seq),
+                              "Refreshing market data…");
   try {
     const res = await api("/refresh", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ kind }),
+      signal: op.signal,
     });
     const data = await res.json();
     if (data && Array.isArray(data.skipped) && data.skipped.includes(kind)) {
@@ -148,15 +190,27 @@ async function refreshNow(kind, statusEl, btn, onDone) {
     }
     const prevMs = prevAsOf ? new Date(prevAsOf).getTime() : 0;
     const deadline = Date.now() + 60000;
-    while (Date.now() < deadline) {
+    let landed = false;
+    while (Date.now() < deadline && opIsCurrent(op.seq)) {
       await new Promise(r => setTimeout(r, 4000));
+      if (!opIsCurrent(op.seq)) break;
       let fresh;
-      try { fresh = await onDone(); } catch (e) { continue; }
+      try { fresh = await onDone({ quiet: true, op }); } catch (e) { continue; }
       const newAsOf = fresh && fresh.as_of;
-      if (newAsOf && new Date(newAsOf).getTime() > prevMs) break;
+      if (newAsOf && new Date(newAsOf).getTime() > prevMs) { landed = true; break; }
+    }
+    // Render exactly once, only if we're still the current op. Whether the new
+    // snapshot landed or we timed out, show the latest DB state.
+    waiting = false;
+    stopPhase();
+    if (opIsCurrent(op.seq)) {
+      if (!landed) statusEl.textContent = "Refresh is taking longer than usual — showing latest.";
+      await onDone({ op });
     }
   } catch (e) {
-    statusEl.textContent = "Refresh failed: " + (e && e.message ? e.message : e);
+    if (!(e && e.name === "AbortError") && opIsCurrent(op.seq)) {
+      statusEl.textContent = "Refresh failed: " + (e && e.message ? e.message : e);
+    }
   } finally {
     waiting = false;
     stopPhase();
@@ -170,6 +224,9 @@ function _saveView(k, v) { try { sessionStorage.setItem(k, v); } catch (e) {} }
 function _readView(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
 
 function switchTab(tab, btn) {
+  // Leaving the tab abandons whatever fetch/refresh it had running: cancel it
+  // so it stops scraping/polling instead of finishing in the background.
+  cancelActiveOp();
   document.querySelectorAll(".tab-content").forEach(el => el.classList.remove("active"));
   document.querySelectorAll(".tab-bar button").forEach(el => el.classList.remove("active"));
   document.getElementById("tab-" + tab).classList.add("active");

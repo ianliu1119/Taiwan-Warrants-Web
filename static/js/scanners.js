@@ -99,45 +99,72 @@ function getFilters() {
   };
 }
 
-async function fetchData() {
+// opts.quiet: fetch only to read as_of (no status/table changes, no phase poll)
+// — used by the refresh wait loop so it doesn't blank+repaint the table every
+// poll. opts.op: run under an existing operation (shared abort/seq) instead of
+// starting a new one; the refresh loop passes its op so its polls don't cancel
+// the refresh. A direct "Fetch" click begins its own op, which aborts whatever
+// was running (previous fetch/refresh) — switching stock stops the old fetch.
+async function fetchData(opts) {
+  opts = opts || {};
+  const quiet = opts.quiet === true;
   const filters = getFilters();
   if (!filters.stock_codes.length) {
-    document.getElementById("status").textContent = "Please select at least one stock.";
+    if (!quiet) document.getElementById("status").textContent = "Please select at least one stock.";
     return;
   }
+  const op = opts.op || beginOp();
   const statusEl = document.getElementById("status");
-  statusEl.textContent = "Fetching…";
-  document.getElementById("tableContainer").innerHTML = "";
-  document.getElementById("downloadBtn").style.display = "none";
-
   // Show the server's current step (loading from DB, or on a live fallback:
-  // scraping CMoney, computing IV…) while the request is in flight.
+  // scraping CMoney, computing IV…) while the request is in flight. Quiet polls
+  // touch no UI, so they get no status reset and no phase poll.
   let inFlight = true;
-  const stopPhase = pollPhase(statusEl, () => inFlight, "Fetching…");
+  const stopPhase = quiet
+    ? () => {}
+    : pollPhase(statusEl, () => inFlight && opIsCurrent(op.seq), "Fetching…");
+  if (!quiet) {
+    statusEl.textContent = "Fetching…";
+    document.getElementById("tableContainer").innerHTML = "";
+    document.getElementById("downloadBtn").style.display = "none";
+  }
   let data;
   try {
     const res = await api("/fetch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(filters),
+      signal: op.signal,
     });
     data = await res.json();
+  } catch (e) {
+    if (e && e.name === "AbortError") return;   // superseded — new op owns the UI
+    if (!quiet && opIsCurrent(op.seq)) statusEl.textContent = "Fetch failed: " + (e && e.message ? e.message : e);
+    return;
   } finally {
     inFlight = false;
     stopPhase();
   }
-  currentData = data.rows;
-  setStatusWithAge("warrants", "status", `${data.count} warrants`, data);
-  document.getElementById("downloadBtn").style.display = "inline-block";
-  renderTable(currentData);
+  // Superseded while the request was in flight: don't paint stale results.
+  if (!opIsCurrent(op.seq)) return data;
+  if (!quiet) {
+    currentData = data.rows;
+    setStatusWithAge("warrants", "status", `${data.count} warrants`, data);
+    document.getElementById("downloadBtn").style.display = "inline-block";
+    renderTable(currentData);
+  }
   return data;
+}
+
+function _clearWarrantTable() {
+  document.getElementById("tableContainer").innerHTML = "";
+  document.getElementById("downloadBtn").style.display = "none";
 }
 
 function refreshWarrants() {
   return refreshNow("warrants",
     document.getElementById("status"),
     document.getElementById("refreshWarrantsBtn"),
-    fetchData);
+    fetchData, _clearWarrantTable);
 }
 
 function renderTable(rows) {
@@ -380,31 +407,55 @@ function getOptionsFilters() {
   };
 }
 
-async function fetchOptionsData() {
+// Mirrors fetchData's op/quiet contract (see there): quiet polls read as_of
+// without touching the UI, opts.op shares the refresh's operation, and a direct
+// click begins a new op that aborts whatever was running.
+async function fetchOptionsData(opts) {
+  opts = opts || {};
+  const quiet = opts.quiet === true;
   const filters = getOptionsFilters();
   if (!filters.stock_codes.length) {
-    document.getElementById("opt-status").textContent = "Please select at least one product.";
+    if (!quiet) document.getElementById("opt-status").textContent = "Please select at least one product.";
     return;
   }
-  document.getElementById("opt-status").textContent = _optMarket === "us" ? "Fetching US ADR options (Yahoo, ~15 min delayed)…" : "Fetching…";
+  const op = opts.op || beginOp();
+  const statusEl = document.getElementById("opt-status");
+  if (!quiet) {
+    statusEl.textContent = _optMarket === "us" ? "Fetching US ADR options (Yahoo, ~15 min delayed)…" : "Fetching…";
+    document.getElementById("opt-tableContainer").innerHTML = "";
+    document.getElementById("optDownloadBtn").style.display = "none";
+  }
+  let data;
+  try {
+    const res = await api(_optMarket === "us" ? "/us_options" : "/fetch_options", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(filters),
+      signal: op.signal,
+    });
+    data = await res.json();
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    if (!quiet && opIsCurrent(op.seq)) statusEl.textContent = "Fetch failed: " + (e && e.message ? e.message : e);
+    return;
+  }
+  if (!opIsCurrent(op.seq)) return data;
+  if (data.error) {
+    if (!quiet) statusEl.textContent = "Error: " + data.error;
+    return data;
+  }
+  if (!quiet) {
+    currentOptionsData = data.rows;
+    setStatusWithAge("options", "opt-status", `${data.count} options`, data);
+    document.getElementById("optDownloadBtn").style.display = "inline-block";
+    renderOptionsTable(currentOptionsData);
+  }
+  return data;
+}
+
+function _clearOptionsTable() {
   document.getElementById("opt-tableContainer").innerHTML = "";
   document.getElementById("optDownloadBtn").style.display = "none";
-
-  const res = await api(_optMarket === "us" ? "/us_options" : "/fetch_options", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(filters),
-  });
-  const data = await res.json();
-  if (data.error) {
-    document.getElementById("opt-status").textContent = "Error: " + data.error;
-    return;
-  }
-  currentOptionsData = data.rows;
-  setStatusWithAge("options", "opt-status", `${data.count} options`, data);
-  document.getElementById("optDownloadBtn").style.display = "inline-block";
-  renderOptionsTable(currentOptionsData);
-  return data;
 }
 
 function refreshOptions() {
@@ -412,7 +463,7 @@ function refreshOptions() {
   return refreshNow(kind,
     document.getElementById("opt-status"),
     document.getElementById("refreshOptionsBtn"),
-    fetchOptionsData);
+    fetchOptionsData, _clearOptionsTable);
 }
 
 function renderOptionsTable(rows) {
