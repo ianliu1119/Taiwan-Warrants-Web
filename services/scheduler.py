@@ -201,7 +201,7 @@ def refresh_tw_options():
         try:
             df = options_logic.fetch_options(
                 [code], "All", min_days=0, max_days=365,
-                compute_iv=True, keep_noniv=True,
+                compute_iv=True, keep_noniv=True, live_only=True,
             )
         except Exception as e:
             # One dead product must not sink the batch.
@@ -230,7 +230,7 @@ def refresh_us_options():
         try:
             df = us_options_logic.fetch_us_options(
                 code, "All", min_days=1, max_days=730,
-                compute_iv=True, keep_noniv=True,
+                compute_iv=True, keep_noniv=True, live_only=True,
             )
         except Exception as e:
             print(f"SCHED: us_option {code} failed: {e}", flush=True)

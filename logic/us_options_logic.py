@@ -422,7 +422,7 @@ def _live_premium_fx(stock_code):
 
 
 def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
-                     compute_iv=True, keep_noniv=False):
+                     compute_iv=True, keep_noniv=False, live_only=False):
     """Return a DataFrame of UMC options priced in TWD per Taiwan share.
 
     Columns mirror options_logic.fetch_options so the same matching code can
@@ -436,8 +436,14 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
     # superset-with-IV; compute_iv=True (scanner) drops non-converged-IV rows,
     # compute_iv=False (arb) keeps the superset. _filter_chain preserves the
     # raise-on-empty-range contract. Empty snapshot / read error falls through
-    # to the live path below; the supabase path never warms _cache.
-    if db_market.snapshot_enabled():
+    # to the live path below; the supabase read path never warms _cache.
+    #
+    # live_only bypasses this read entirely. The snapshot WRITER (scheduler ->
+    # refresh_us_options) runs in the same process where MARKET_SOURCE=supabase,
+    # so without this flag it would read the existing snapshot and write it
+    # straight back — never fetching fresh quotes. The writer sets live_only=True
+    # so a refresh always pulls live and repopulates.
+    if db_market.snapshot_enabled() and not live_only:
         snap = None
         try:
             set_phase("Loading market data from database…")

@@ -542,13 +542,20 @@ def fetch_options(
     min_volume=0,
     compute_iv=True,
     keep_noniv=False,
+    live_only=False,
 ):
     # Snapshot-first read (MARKET_SOURCE=supabase). The stored snapshot is the
     # superset-with-IV; compute_iv=True (scanner) drops non-converged-IV rows,
     # compute_iv=False (arb) keeps the superset. Empty snapshot / read error
     # falls through to the live path; a non-empty snapshot keeps the live
     # raise-on-empty contract.
-    if db_market.snapshot_enabled():
+    #
+    # live_only bypasses this read entirely. The snapshot WRITER (scheduler ->
+    # refresh_tw_options) runs in the same process where MARKET_SOURCE=supabase,
+    # so without this flag it would read the existing snapshot and write it
+    # straight back — never fetching fresh quotes. The writer sets live_only=True
+    # so a refresh always pulls live and repopulates.
+    if db_market.snapshot_enabled() and not live_only:
         snap = None
         try:
             set_phase("Loading market data from database…")
