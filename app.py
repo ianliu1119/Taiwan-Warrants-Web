@@ -40,16 +40,6 @@ app.json.sort_keys = False
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.jinja_env.auto_reload = True
 
-# Data routes return large repeated-key JSON tables (~10:1 compressible) and
-# Render's proxy doesn't gzip, so compress responses here. Optional dep — degrade
-# gracefully if it isn't installed in a dev env (flask-compress skips small
-# responses and honors Accept-Encoding on its own).
-try:
-    from flask_compress import Compress
-    Compress(app)
-except ImportError:
-    print("flask-compress not installed; responses served uncompressed")
-
 # Render pings /healthz constantly; static assets are noise too. The two poll
 # endpoints are hit once a second while a progress bar is up, and the work they
 # report on (universe build, fetch phase) logs its own progress separately, so
