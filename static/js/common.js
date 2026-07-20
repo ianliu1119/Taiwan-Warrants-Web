@@ -1,0 +1,357 @@
+// Shared: Supabase auth, fetch wrapper, tab nav + view persistence, table helpers.
+
+const DEFAULT_STOCKS = [
+  "2330","2317","2454","2382","3231","6669","2376","3017","3324",
+  "2308","3711","3034","2379","3661","3443","2603","3008","2881",
+  "2882","3037","2303","2886",
+];
+
+// --- Supabase auth bootstrap -------------------------------------------
+
+const SUPABASE_URL = window.SUPABASE_URL;
+
+const SUPABASE_ANON_KEY = window.SUPABASE_ANON_KEY;
+// Local redundancy instance: no login, no Supabase client, no /login redirects.
+
+const LOCAL_MODE = window.LOCAL_MODE;
+// window.supabase is undefined when the CDN script was blocked (ad-blocker);
+// _boot() then shows a full-page error instead of letting the script crash.
+
+let _sb = null;
+
+if (!LOCAL_MODE && SUPABASE_URL && window.supabase) {
+  _sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+}
+
+function _logout() {
+  if (_sb) _sb.auth.signOut();
+  else location.replace("/login");
+}
+
+// fetch() wrapper that injects the Supabase bearer token and handles
+// auth failures. Falls back to plain fetch when auth is not configured.
+
+async function api(url, opts) {
+  // Local mode: no bearer token, no 401/403 handling — the local server
+  // never challenges auth.
+  if (LOCAL_MODE || !_sb) return fetch(url, opts);
+  const { data } = await _sb.auth.getSession();
+  const token = data.session && data.session.access_token;
+  opts = opts || {};
+  const headers = Object.assign({}, opts.headers || {});
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const res = await fetch(url, Object.assign({}, opts, { headers }));
+  if (res.status === 401) { location.replace("/login"); throw new Error("unauthorized"); }
+  if (res.status === 403) {
+    document.body.innerHTML =
+      '<div style="max-width:420px;margin:15vh auto;text-align:center;font-family:inherit;color:#e2e8f0">' +
+      '<h2 style="font-size:18px;margin-bottom:10px">Your account is not approved yet</h2>' +
+      '<p style="color:#8b90a0;font-size:13px">Ask the administrator to add your email to the allow-list.</p>' +
+      '<p style="margin-top:16px"><a href="#" onclick="_logout();return false" style="color:#4f8ef7">Sign out</a></p></div>';
+    throw new Error("not_allowed");
+  }
+  return res;
+}
+
+// ── Single-operation guard ───────────────────────────────────────────
+// Only one fetch/refresh may own the UI at a time. Starting a new operation
+// (or switching tab) aborts the previous one so its in-flight request is
+// cancelled and its polling loops stop — no two heavy operations pile up, and
+// a superseded op never renders stale results over the new one.
+//
+// Two mechanisms together: an AbortController cancels the network request, and
+// a monotonic sequence number lets already-running async loops (phase pollers,
+// the refresh wait loop) notice they are no longer current and bail. A caller
+// begins an op, then passes its {seq, signal} down so sub-requests (e.g. the
+// refresh poll's quiet fetches) share the same op instead of starting new ones.
+let _activeAbort = null;
+let _opSeq = 0;
+
+function beginOp() {
+  if (_activeAbort) _activeAbort.abort();
+  _activeAbort = new AbortController();
+  return { seq: ++_opSeq, signal: _activeAbort.signal };
+}
+
+function opIsCurrent(seq) {
+  return seq === _opSeq;
+}
+
+function cancelActiveOp() {
+  if (_activeAbort) { _activeAbort.abort(); _activeAbort = null; }
+  _opSeq++;   // invalidate any loop still checking the old seq
+}
+
+// "updated N min ago" suffix for scanner status lines, from the
+// as_of/cached fields the backend attaches to cached market data.
+
+function asOfLabel(data) {
+  if (!data || !data.as_of) return "";
+  const mins = Math.max(0, Math.round((Date.now() - new Date(data.as_of).getTime()) / 60000));
+  const age = mins === 0 ? "updated just now" : `updated ${mins} min ago`;
+  return ` · ${age}${data.cached === false ? " (live fetch)" : ""}`;
+}
+
+// Live-ticking "updated N min ago". A fetch handler sets the status via
+// setStatusWithAge, which remembers the count prefix + the data object per
+// scanner. A single interval then re-renders just the age suffix every 30s,
+// so the minute count climbs without re-fetching. Keyed by scanner name.
+
+window._lastAsOf = window._lastAsOf || {};
+
+function setStatusWithAge(key, elId, base, data) {
+  window._lastAsOf[key] = { elId, base, data };
+  const el = document.getElementById(elId);
+  if (el) el.textContent = base + asOfLabel(data);
+}
+
+function _tickAges() {
+  for (const key in window._lastAsOf) {
+    const rec = window._lastAsOf[key];
+    if (!rec || !rec.data) continue;
+    const el = document.getElementById(rec.elId);
+    // Skip missing or hidden (inactive-tab) status lines, and never clobber a
+    // transient message (e.g. "Fetching…") that replaced the count line.
+    if (!el || el.offsetParent === null) continue;
+    if (!el.textContent.startsWith(rec.base)) continue;
+    el.textContent = rec.base + asOfLabel(rec.data);
+  }
+}
+
+setInterval(_tickAges, 30000);
+
+// "Refresh now" helper shared by both scanner tabs. Kicks the backend's
+// debounced background re-scrape, then polls the tab's own fetch until the
+// snapshot's as_of advances (so the table auto-updates when the scrape lands)
+// or a 60s cap elapses. Always re-enables the button, even on error.
+
+// Poll /fetch_status while `active()` is true, writing the server's current
+// work phase (loading from DB, fetching cmkey, scraping CMoney, computing IV,
+// saving) into statusEl so the user sees which step a fetch/refresh is on.
+// Best-effort: falls back to fallbackText when the server reports no phase, and
+// silently stops on error or when active() goes false. Returns a stop()
+// function so the caller can end polling before writing its final status.
+function pollPhase(statusEl, active, fallbackText) {
+  if (!statusEl) return () => {};
+  let stopped = false;
+  // This poll loop's own start time — the live elapsed shown next to the phase.
+  // A fresh pollPhase (one per fetch/refresh) resets it, so each operation
+  // counts up from zero.
+  const t0 = performance.now();
+  (async function loop() {
+    while (!stopped && active()) {
+      let phase = null;
+      try {
+        phase = (await (await fetch("/fetch_status")).json()).phase;
+      } catch (e) { /* transient — keep polling */ }
+      if (stopped || !active()) break;
+      const secs = Math.floor((performance.now() - t0) / 1000);
+      statusEl.textContent = (phase || fallbackText) + ` (${secs}s)`;
+      await new Promise(r => setTimeout(r, 800));
+    }
+  })();
+  return () => { stopped = true; };
+}
+
+// While a refresh runs, the table is NOT re-rendered on every poll. The DB rows
+// don't change until the background writer swaps the snapshot pointer at the
+// end, so re-drawing every 4s just blanks and repaints identical data. Instead
+// we clear the table once, show only the live phase messages, poll QUIETLY
+// (fetch just to read as_of, no render), and render the table a single time
+// once fresh data has landed. clearTable/renderFinal let each tab plug in its
+// own table handling while refreshNow owns the wait/poll/phase logic.
+async function refreshNow(kind, statusEl, btn, onDone, clearTable) {
+  if (!statusEl || !btn) return;
+  const op = beginOp();
+  const origLabel = btn.textContent;
+  const wasDisabled = btn.disabled;
+  // Pre-refresh as_of, read from the last stored fetch for this status line.
+  let prevAsOf = null;
+  for (const k in window._lastAsOf) {
+    const rec = window._lastAsOf[k];
+    if (rec && rec.elId === statusEl.id && rec.data) { prevAsOf = rec.data.as_of || null; break; }
+  }
+  btn.disabled = true;
+  btn.textContent = "Refreshing…";
+  statusEl.textContent = "Refreshing market data… (up to ~30s)";
+  // Hide the stale table for the duration — only phase messages show until the
+  // fresh snapshot is pulled and rendered once at the end.
+  if (typeof clearTable === "function") clearTable();
+  // Surface the background refresh's live step (scraping CMoney, computing IV,
+  // saving…) while we wait for the new snapshot to land.
+  let waiting = true;
+  const stopPhase = pollPhase(statusEl, () => waiting && opIsCurrent(op.seq),
+                              "Refreshing market data…");
+  try {
+    const res = await api("/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind }),
+      signal: op.signal,
+    });
+    const data = await res.json();
+    if (data && Array.isArray(data.skipped) && data.skipped.includes(kind)) {
+      statusEl.textContent = "A refresh is already running — showing latest.";
+    }
+    const prevMs = prevAsOf ? new Date(prevAsOf).getTime() : 0;
+    const deadline = Date.now() + 60000;
+    let landed = false;
+    while (Date.now() < deadline && opIsCurrent(op.seq)) {
+      await new Promise(r => setTimeout(r, 4000));
+      if (!opIsCurrent(op.seq)) break;
+      let fresh;
+      try { fresh = await onDone({ quiet: true, op }); } catch (e) { continue; }
+      const newAsOf = fresh && fresh.as_of;
+      if (newAsOf && new Date(newAsOf).getTime() > prevMs) { landed = true; break; }
+    }
+    // Render exactly once, only if we're still the current op. Whether the new
+    // snapshot landed or we timed out, show the latest DB state.
+    waiting = false;
+    stopPhase();
+    if (opIsCurrent(op.seq)) {
+      if (!landed) statusEl.textContent = "Refresh is taking longer than usual — showing latest.";
+      await onDone({ op });
+    }
+  } catch (e) {
+    if (!(e && e.name === "AbortError") && opIsCurrent(op.seq)) {
+      statusEl.textContent = "Refresh failed: " + (e && e.message ? e.message : e);
+    }
+  } finally {
+    waiting = false;
+    stopPhase();
+    btn.disabled = wasDisabled;
+    btn.textContent = origLabel;
+  }
+}
+
+function _saveView(k, v) { try { sessionStorage.setItem(k, v); } catch (e) {} }
+
+function _readView(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
+
+function switchTab(tab, btn) {
+  // Leaving the tab abandons whatever fetch/refresh it had running: cancel it
+  // so it stops scraping/polling instead of finishing in the background.
+  cancelActiveOp();
+  document.querySelectorAll(".tab-content").forEach(el => el.classList.remove("active"));
+  document.querySelectorAll(".tab-bar button").forEach(el => el.classList.remove("active"));
+  document.getElementById("tab-" + tab).classList.add("active");
+  btn.classList.add("active");
+  _saveView("ws_activeTab", tab);
+}
+
+// Re-apply the tab + options sub-market saved before the last reload. The
+// HTML already renders the Options/Taiwan default, so this only acts when a
+// different view was active. Runs after auth in _boot.
+
+function restoreView() {
+  const tab = _readView("ws_activeTab");
+  if (tab && tab !== "options") {
+    const btn = document.querySelector(`.tab-bar button[onclick*="switchTab('${tab}'"]`);
+    if (btn) { switchTab(tab, btn); if (tab === "portfolio") loadPortfolioOnce(); }
+  }
+  if (_readView("ws_optMarket") === "us") {
+    const b = document.getElementById("optmkt-btn-us");
+    if (b) setOptMarket("us", b);
+  }
+}
+
+const HIDDEN_COLS = ["warrant_iv", "opt_iv", "iv_diff",
+  // TW/US raw depth fields — surfaced in the popup panel, not the table.
+  "tw_depth_contracts", "tw_fillable", "us_volume", "us_oi"];
+// The US Option Match "us_stock_code" value is actually the TW stock code.
+
+const COL_LABELS = { us_stock_code: "tw_stock_code",
+                     warrant_depth_lots: "depth (張)", fillable: "fillable?" };
+
+const visCols = (row) => Object.keys(row).filter(c => !HIDDEN_COLS.includes(c));
+
+const colLabel = (c) => COL_LABELS[c] || c;
+
+// ── Market session clock (NYSE / TWSE / TAIFEX options) ──────────────
+// NYSE runs in US Eastern; TWSE and TAIFEX in Taipei. Sessions are wall-
+// clock ranges in each exchange's own timezone (minutes past midnight).
+// Holidays are not modeled — weekday hours only.
+function _tzParts(tz) {
+  const f = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour12: false,
+    weekday: "short", hour: "2-digit", minute: "2-digit" });
+  const o = {}; f.formatToParts(new Date()).forEach(p => o[p.type] = p.value);
+  const h = parseInt(o.hour, 10) % 24, m = parseInt(o.minute, 10);
+  return { wd: o.weekday, mins: h * 60 + m, str: String(h).padStart(2, "0") + ":" + o.minute };
+}
+function _mcSet(id, txt, cls) {
+  const e = document.getElementById(id); if (!e) return;
+  e.textContent = txt; e.className = "mc-badge " + cls;
+}
+function updateMarketClock() {
+  const et = _tzParts("America/New_York"), tp = _tzParts("Asia/Taipei"),
+        pt = _tzParts("America/Los_Angeles");
+  document.getElementById("mc-ny-time").textContent = et.str;
+  document.getElementById("mc-pt-time").textContent = pt.str;
+  document.getElementById("mc-tw-time").textContent = tp.str;
+  const nyWknd = et.wd === "Sat" || et.wd === "Sun", nt = et.mins;
+  // NYSE: pre 04:00–09:30, regular 09:30–16:00, after 16:00–20:00
+  if (!nyWknd && nt >= 570 && nt < 960) _mcSet("mc-ny-st", "Open", "mc-open");
+  else if (!nyWknd && nt >= 960 && nt < 1200) _mcSet("mc-ny-st", "After-hrs", "mc-after");
+  else if (!nyWknd && nt >= 240 && nt < 570) _mcSet("mc-ny-st", "Pre-mkt", "mc-after");
+  else _mcSet("mc-ny-st", "Closed", "mc-closed");
+  // TWSE stocks: 09:00–13:30
+  const twWknd = tp.wd === "Sat" || tp.wd === "Sun", tt = tp.mins;
+  if (!twWknd && tt >= 540 && tt < 810) _mcSet("mc-tw-st", "Open", "mc-open");
+  else _mcSet("mc-tw-st", "Closed", "mc-closed");
+  // TAIFEX options: regular 08:45–13:45; after-hours 15:00–05:00 next day.
+  // Evening leg (15:00–24:00) runs Mon–Fri; morning leg (00:00–05:00) is
+  // the continuation of the prior weekday session, so it's live Tue–Sat.
+  const weekday = !twWknd;
+  if (weekday && tt >= 525 && tt < 825) _mcSet("mc-tx-st", "Regular", "mc-open");
+  else if (weekday && tt >= 900) _mcSet("mc-tx-st", "After-hrs", "mc-after");
+  else if (tt < 300 && tp.wd !== "Sun" && tp.wd !== "Mon") _mcSet("mc-tx-st", "After-hrs", "mc-after");
+  else _mcSet("mc-tx-st", "Closed", "mc-closed");
+}
+// ── Hover tooltips: trading hours per exchange, in the USER's local tz ──
+// Session ranges are wall-clock minutes past midnight in each exchange's own
+// timezone; end < start (e.g. TAIFEX night) is expressed as end + 1440.
+const MC_SESSIONS = {
+  "mc-row-ny": { name: "NYSE", tz: "America/New_York",
+    rows: [["Pre-market", 240, 570], ["Regular", 570, 960], ["After-hours", 960, 1200]] },
+  "mc-row-tw": { name: "TWSE", tz: "Asia/Taipei",
+    rows: [["Regular", 540, 810]] },
+  "mc-row-tx": { name: "TAIFEX opt", tz: "Asia/Taipei",
+    rows: [["Regular", 525, 825], ["After-hours", 900, 1740]] },
+};
+// Minutes a timezone is ahead of UTC at instant `at` (DST-aware).
+function _tzOffset(tz, at) {
+  const f = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const p = {}; f.formatToParts(at).forEach(x => p[x.type] = x.value);
+  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second);
+  return Math.round((asUTC - at.getTime()) / 60000);
+}
+const _hm = (min) => { min = ((min % 1440) + 1440) % 1440;
+  return String(Math.floor(min / 60)).padStart(2, "0") + ":" + String(min % 60).padStart(2, "0"); };
+// Convert an exchange-tz wall-clock range to the viewer's local wall-clock,
+// tagging any endpoint that lands on a different local day (+1d / -1d).
+function _mcRange(tz, s, e) {
+  const now = new Date();
+  const delta = (-now.getTimezoneOffset()) - _tzOffset(tz, now);
+  const sa = s + delta, ea = e + delta, base = Math.floor(sa / 1440);
+  const mark = (v) => { const d = Math.floor(v / 1440) - base;
+    return d === 0 ? "" : (d > 0 ? ` (+${d}d)` : ` (${d}d)`); };
+  return _hm(sa) + mark(sa) + "–" + _hm(ea) + mark(ea);
+}
+function mcBuildTips() {
+  for (const id in MC_SESSIONS) {
+    const row = document.getElementById(id); if (!row) continue;
+    let tip = row.querySelector(".mc-tip");
+    if (!tip) { tip = document.createElement("div"); tip.className = "mc-tip"; row.appendChild(tip); }
+    const cfg = MC_SESSIONS[id];
+    let html = '<div class="mc-tip-h">' + cfg.name + " · your local time</div>";
+    for (const [label, s, e] of cfg.rows)
+      html += '<div class="mc-tip-r"><span class="mc-tip-k">' + label +
+        '</span><span class="mc-tip-v">' + _mcRange(cfg.tz, s, e) + "</span></div>";
+    tip.innerHTML = html;
+  }
+}
+
+updateMarketClock(); mcBuildTips();
+setInterval(() => { updateMarketClock(); mcBuildTips(); }, 15000);

@@ -17,12 +17,14 @@ single spot FX snapshot is used for every conversion.
 """
 
 import time
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from statsmodels.tsa.stattools import adfuller
 
-from warrant_logic import implied_vol, bs_delta, calc_real_leverage
+from services import applog
+from services import db_market
+from logic.warrant_logic import implied_vol, bs_delta, calc_real_leverage, set_phase
 
 # One US option contract covers 100 ADRs. The number of ordinary (Taiwan)
 # shares per ADR ("adr_ratio") is per-listing, so contract size in Taiwan
@@ -45,8 +47,37 @@ def contract_tw_shares(stock_code):
     """Taiwan shares controlled by one US option contract for this listing."""
     return US_CONTRACT_ADRS * US_ADR_MAP[stock_code]["adr_ratio"]
 
+# Full option chain per (stock_code, compute_iv); day-range and type filters
+# are applied per call so one scheduler warm-up serves every filter combo.
 _cache: dict = {}
-_CACHE_TTL = 45  # keep US option quotes fresh (Yahoo is already ~15 min delayed)
+_CACHE_TTL = 1200  # refreshed every 15 min by the scheduler (Yahoo is ~15 min delayed anyway)
+
+
+def data_as_of(stock_code):
+    """Timestamp (epoch) of the cached chain for this code, or None."""
+    # Snapshot mode: freshness is the snapshot batch's created_at as an epoch.
+    if db_market.snapshot_enabled():
+        try:
+            iso = db_market.snapshot_as_of("us_options")
+        except Exception:
+            iso = None
+        if iso:
+            return datetime.fromisoformat(iso).timestamp()
+        return None
+    ts_list = [
+        ts for (code, _civ), (ts, _df) in _cache.items() if code == stock_code
+    ]
+    return min(ts_list) if ts_list else None
+
+
+def refresh_cache(stock_codes):
+    """Scheduler hook: drop and refetch both cached chain variants per code."""
+    for code in stock_codes:
+        for civ in (True, False):
+            _cache.pop((code, civ), None)
+        # Scanner path (with IV) and arb path (without) cache separately.
+        fetch_us_options(code, "All", min_days=1, max_days=730, compute_iv=True)
+        fetch_us_options(code, "All", min_days=1, max_days=730, compute_iv=False)
 
 _prem_cache: dict = {}
 _PREM_TTL = 1800  # 30 minutes — 3y premium HISTORY only; the "now" point is refreshed live
@@ -270,6 +301,9 @@ def _adf_test(series):
     if len(x) < 30:
         return out
     try:
+        # Lazy import: statsmodels is heavy on the 512MB host, so keep it out of
+        # module-import cost and degrade gracefully if it isn't installed.
+        from statsmodels.tsa.stattools import adfuller
         stat, pval, usedlag, nobs, crit, _ = adfuller(x, autolag="AIC")
     except Exception:
         return out
@@ -388,7 +422,7 @@ def _live_premium_fx(stock_code):
 
 
 def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
-                     compute_iv=True):
+                     compute_iv=True, keep_noniv=False, live_only=False):
     """Return a DataFrame of UMC options priced in TWD per Taiwan share.
 
     Columns mirror options_logic.fetch_options so the same matching code can
@@ -398,16 +432,58 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
     if stock_code not in US_ADR_MAP:
         raise RuntimeError(f"{stock_code}: no US ADR mapping")
 
+    # Snapshot-first read (MARKET_SOURCE=supabase). The stored snapshot is the
+    # superset-with-IV; compute_iv=True (scanner) drops non-converged-IV rows,
+    # compute_iv=False (arb) keeps the superset. _filter_chain preserves the
+    # raise-on-empty-range contract. Empty snapshot / read error falls through
+    # to the live path below; the supabase read path never warms _cache.
+    #
+    # live_only bypasses this read entirely. The snapshot WRITER (scheduler ->
+    # refresh_us_options) runs in the same process where MARKET_SOURCE=supabase,
+    # so without this flag it would read the existing snapshot and write it
+    # straight back — never fetching fresh quotes. The writer sets live_only=True
+    # so a refresh always pulls live and repopulates.
+    if db_market.snapshot_enabled() and not live_only:
+        snap = None
+        try:
+            set_phase("Loading market data from database…")
+            snap, _as_of = db_market.read_snapshot("us_options", codes=[stock_code])
+        except Exception as e:
+            applog.log("USOPT", f"supabase read failed ({e}) — falling back to live")
+            snap = None
+        if snap is not None and not snap.empty:
+            if compute_iv:
+                snap = snap[snap["iv_ask"].notna()]
+            else:
+                # Live compute_iv=False emits NaN IV-derived metrics; blank the
+                # superset's stored values so the arb path (which branches on IV
+                # presence) matches the live arb frame exactly.
+                snap = snap.copy()
+                for _c in ("iv_ask", "iv_bid", "delta_calc"):
+                    if _c in snap.columns:
+                        snap[_c] = np.nan
+            return _filter_chain(snap, option_type, min_days, max_days)
+
     cfg = US_ADR_MAP[stock_code]
-    cache_key = (stock_code, option_type, min_days, max_days)
+    # The cache holds the FULL chain (all types, all expiries); the requested
+    # option_type/day-range are filter views applied on the way out, so a
+    # background warm-up serves every filter combination.
+    cache_key = (stock_code, compute_iv, keep_noniv)
     hit = _cache.get(cache_key)
     if hit and time.time() - hit[0] < _CACHE_TTL:
-        return hit[1].copy()
+        applog.log(
+            "USOPT",
+            f"{stock_code} {cfg['adr_ticker']} cache hit (age {int(time.time() - hit[0])}s)",
+        )
+        return _filter_chain(hit[1], option_type, min_days, max_days)
 
+    set_phase("Fetching US ADR option chain (Yahoo)…")
+    t0 = time.time()
     adr_ratio = cfg["adr_ratio"]             # ordinary shares per ADR
     adr = _last_price(cfg["adr_ticker"])     # USD per ADR
     fx = _last_price(cfg["fx_ticker"])       # TWD per USD
     if adr <= 0 or fx <= 0:
+        applog.log("USOPT", f"{stock_code} bad ADR price ({adr}) or FX ({fx})")
         raise RuntimeError("bad ADR price or FX")
 
     # Underlying value expressed per Taiwan share, in TWD — the same basis the
@@ -417,24 +493,33 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
     tk = yf.Ticker(cfg["adr_ticker"])
     expiries = tk.options
     if not expiries:
+        applog.log("USOPT", f"{stock_code} {cfg['adr_ticker']} no option expiries")
         raise RuntimeError(f"{cfg['adr_ticker']}: no option expiries")
+
+    # One yfinance round-trip per expiry, so this walk is the slow part; logging
+    # before it starts makes a hang attributable to this stage.
+    applog.log(
+        "USOPT",
+        f"{stock_code} {cfg['adr_ticker']} walking {len(expiries)} expiries "
+        f"(adr={adr} fx={fx})",
+    )
 
     today = pd.Timestamp.now().normalize()
     rows = []
+    failed_exp = 0
     for exp in expiries:
         exp_ts = pd.Timestamp(exp)
         dte = int((exp_ts - today).days)
-        if dte < int(min_days) or dte > int(max_days):
+        if dte < 1:
             continue
         try:
             chain = tk.option_chain(exp)
         except Exception:
+            failed_exp += 1
             continue
 
         for is_put, leg in ((False, chain.calls), (True, chain.puts)):
             opt_type = "Put" if is_put else "Call"
-            if option_type != "All" and opt_type != option_type:
-                continue
             for _, o in leg.iterrows():
                 K_usd = float(o.get("strike", np.nan))
                 bid_usd = float(o.get("bid", np.nan) or np.nan)
@@ -465,9 +550,13 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
                     if np.isnan(iv_ask) and not np.isnan(iv_bid):
                         iv_ask = iv_bid
                     if np.isnan(iv_ask):
-                        continue
-
-                    delta = bs_delta(adr, K_usd, T, R_US, iv_ask, 1.0, is_put)
+                        # keep_noniv (superset-with-IV mode): keep the row with
+                        # all IV-derived metrics NaN instead of dropping it.
+                        if not keep_noniv:
+                            continue
+                        iv_ask = iv_bid = delta = np.nan
+                    else:
+                        delta = bs_delta(adr, K_usd, T, R_US, iv_ask, 1.0, is_put)
                 else:
                     # Arb finder does not use IV/delta — skip the solve so an
                     # option is never dropped just because IV wouldn't converge.
@@ -503,8 +592,28 @@ def fetch_us_options(stock_code, option_type="All", min_days=1, max_days=365,
                 })
 
     if not rows:
+        applog.log(
+            "USOPT",
+            f"{stock_code} {cfg['adr_ticker']} -> 0 contracts from "
+            f"{len(expiries)} expiries in {time.time() - t0:.1f}s",
+        )
         raise RuntimeError("no US options in range")
 
+    applog.log(
+        "USOPT",
+        f"{stock_code} {cfg['adr_ticker']} fetched {len(rows)} contracts from "
+        f"{len(expiries)} expiries in {time.time() - t0:.1f}s"
+        + (f" ({failed_exp} expiries failed)" if failed_exp else ""),
+    )
     df = pd.DataFrame(rows).sort_values(["days_to_expiry", "strike"]).reset_index(drop=True)
     _cache[cache_key] = (time.time(), df.copy())
-    return df
+    return _filter_chain(df, option_type, min_days, max_days)
+
+
+def _filter_chain(df, option_type, min_days, max_days):
+    view = df[df["days_to_expiry"].between(int(min_days), int(max_days))]
+    if option_type != "All":
+        view = view[view["type"] == option_type]
+    if view.empty:
+        raise RuntimeError("no US options in range")
+    return view.copy().reset_index(drop=True)
